@@ -36,12 +36,14 @@ const std::vector<int> ChannelHopper::CHANNELS_5GHZ = {
 };
 
 // Returns the iw HT-mode string for a given HT Operation secondary ch offset.
-// For 5 GHz (ch > 14) we let iw pick the width automatically.
+// ht_oper=0 means "no HT info / HT20" — we intentionally don't add any flag
+// so that the hopper works without HT20 (which some drivers reject when hopping).
+// Only HT40+ / HT40- are set explicitly, as they change which frequencies are used.
 static const char* ht_mode_str(int ch, uint8_t ht_oper) {
-    if (ch > 14) return "";          // 5 GHz: don't force HT mode via channel cmd
+    if (ch > 14) return "";   // 5 GHz: let iw decide width
     if (ht_oper == 1) return "HT40+";
     if (ht_oper == 3) return "HT40-";
-    return "HT20";
+    return "";                // HT20 or unknown: no flag needed, adapter receives HT20 fine
 }
 
 void ChannelHopper::set_channel(int ch, uint8_t ht_oper) {
