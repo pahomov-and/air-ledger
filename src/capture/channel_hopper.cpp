@@ -1,6 +1,7 @@
 #include "channel_hopper.hpp"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <signal.h>
@@ -16,6 +17,11 @@ static int safe_system(const char* cmd) {
     int rc = system(cmd); // NOLINT
     sigaction(SIGCHLD, &sa_old, nullptr);
     return rc;
+}
+
+static const char* iw_bin() {
+    const char* p = std::getenv("AIR_LEDGER_IW_BIN");
+    return (p && *p) ? p : "iw";
 }
 
 // Non-overlapping order: hit 1/6/11 first, then fill the rest
@@ -46,20 +52,47 @@ static const char* ht_mode_str(int ch, uint8_t ht_oper) {
     return "";                // HT20 or unknown: no flag needed, adapter receives HT20 fine
 }
 
-void ChannelHopper::set_channel(int ch, uint8_t ht_oper) {
+bool ChannelHopper::set_channel(int ch, uint8_t ht_oper) {
     std::lock_guard<std::mutex> lk(ch_mutex_);
-    char cmd[128];
+    char cmd[384];
     const char* ht = ht_mode_str(ch, ht_oper);
+    const char* iw = iw_bin();
     if (ht[0])
         std::snprintf(cmd, sizeof(cmd),
-            "iw dev %s set channel %d %s 2>/dev/null", iface_.c_str(), ch, ht);
+            "%s dev %s set channel %d %s 2>/dev/null", iw, iface_.c_str(), ch, ht);
     else
         std::snprintf(cmd, sizeof(cmd),
-            "iw dev %s set channel %d 2>/dev/null", iface_.c_str(), ch);
+            "%s dev %s set channel %d 2>/dev/null", iw, iface_.c_str(), ch);
     int rc = safe_system(cmd);
-    if (rc != 0)
-        std::fprintf(stderr, "[hopper] iw failed ch=%d ht=%s rc=%d\n", ch, ht, rc);
+    if (rc != 0) {
+        std::fprintf(stderr, "[hopper] iw failed ch=%d ht=%s rc=%d\n", ch, ht[0] ? ht : "auto", rc);
+        // Some drivers reject HT40 hints during hopping/monitor mode.
+        // Retry without width flags so we still pin the primary channel.
+        if (ht[0]) {
+            std::snprintf(cmd, sizeof(cmd),
+                "%s dev %s set channel %d 2>/dev/null", iw, iface_.c_str(), ch);
+            int rc2 = safe_system(cmd);
+            if (rc2 != 0) {
+                std::fprintf(stderr, "[hopper] iw retry failed ch=%d ht=auto rc=%d\n", ch, rc2);
+                return false;
+            }
+            std::fprintf(stderr, "[hopper] iw retry ok ch=%d ht=auto\n", ch);
+        } else {
+            return false;
+        }
+    }
     current_ch_.store(ch);
+    return true;
+}
+
+bool ChannelHopper::iface_on_channel(int ch) const {
+    char cmd[512];
+    const char* iw = iw_bin();
+    std::snprintf(
+        cmd, sizeof(cmd),
+        "%s dev %s info 2>/dev/null | grep -Eq 'channel[[:space:]]+%d([[:space:]]|\\()'",
+        iw, iface_.c_str(), ch);
+    return safe_system(cmd) == 0;
 }
 
 bool ChannelHopper::probe_5ghz_support(const std::string& iface) {
@@ -81,9 +114,10 @@ bool ChannelHopper::probe_5ghz_support(const std::string& iface) {
 
     // Step 2: check if that phy lists any 5 GHz frequency.
     // iw formats them as "5180.0 MHz" — match the decimal form.
+    const char* iw = iw_bin();
     char cmd[256];
     std::snprintf(cmd, sizeof(cmd),
-        "iw phy %s info 2>/dev/null | grep -q '5[0-9][0-9][0-9]\\.'", phy_name);
+        "%s phy %s info 2>/dev/null | grep -q '5[0-9][0-9][0-9]\\.'", iw, phy_name);
     int rc = safe_system(cmd);
     bool supported = (rc == 0);
     std::fprintf(stderr, "[hopper] %s 5 GHz support: %s\n",
@@ -91,14 +125,33 @@ bool ChannelHopper::probe_5ghz_support(const std::string& iface) {
     return supported;
 }
 
-void ChannelHopper::lock_channel(int ch, uint8_t ht_oper) {
+bool ChannelHopper::lock_channel(int ch, uint8_t ht_oper) {
     locked_ht_oper_.store(ht_oper);
     locked_ch_.store(ch);
     if (ch != 0) {
-        set_channel(ch, ht_oper);
+        bool ok = set_channel(ch, ht_oper);
+        if (!ok) {
+            std::fprintf(stderr, "[hopper] lock failed ch=%d %s\n", ch, ht_mode_str(ch, ht_oper));
+            return false;
+        }
+
+        // Verify that driver actually switched (some chipsets return success
+        // but keep the old channel in monitor mode).
+        if (!iface_on_channel(ch)) {
+            std::fprintf(stderr, "[hopper] lock verify mismatch: requested ch=%d (iface stayed elsewhere)\n", ch);
+            // One extra force attempt without HT flags.
+            if (!set_channel(ch, 0) || !iface_on_channel(ch)) {
+                std::fprintf(stderr, "[hopper] lock verify failed after retry ch=%d\n", ch);
+                return false;
+            }
+            std::fprintf(stderr, "[hopper] lock verify ok after retry ch=%d ht=auto\n", ch);
+        }
+
         std::fprintf(stderr, "[hopper] locked to ch=%d %s\n", ch, ht_mode_str(ch, ht_oper));
+        return true;
     } else {
         std::fprintf(stderr, "[hopper] unlocked — resuming hop\n");
+        return true;
     }
 }
 

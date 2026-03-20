@@ -29,8 +29,8 @@ public:
 
     // Lock to a specific channel (0 = unlock, resume hopping).
     // ht_oper: HT Operation IE secondary ch offset (0=HT20, 1=HT40+, 3=HT40-).
-    void lock_channel(int ch, uint8_t ht_oper = 0);
-    void unlock() { lock_channel(0); }
+    bool lock_channel(int ch, uint8_t ht_oper = 0);
+    bool unlock() { return lock_channel(0); }
     bool is_locked()     const { return locked_ch_.load() != 0; }
     int  locked_channel() const { return locked_ch_.load(); }
 
@@ -49,7 +49,8 @@ private:
     bool               has_5ghz_{false};
     std::vector<int>   active_channels_; // built at start() time
 
-    void set_channel(int ch, uint8_t ht_oper = 0);
+    bool set_channel(int ch, uint8_t ht_oper = 0);
+    bool iface_on_channel(int ch) const;
     void loop();
 
     // Returns true if the phy backing iface supports 5 GHz frequencies.
