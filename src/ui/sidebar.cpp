@@ -27,19 +27,44 @@ std::string Sidebar::format_age(uint64_t ts_us, uint64_t now_ust) const {
 }
 
 void Sidebar::draw_text(const std::string& text, int x, int& y, SDL_Color color) {
-    if (!font_ || text.empty()) { y += 18; return; }
-    SDL_Surface* surf = TTF_RenderUTF8_Blended(font_, text.c_str(), color);
-    if (!surf) { y += 18; return; }
-    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer_, surf);
-    SDL_FreeSurface(surf);
-    if (!tex) { y += 18; return; }
+    if (!font_) { y += 18; return; }
+    if (text.empty()) { y += step(); return; }
+    int max_w = std::max(20, w_ - 14);
 
-    int tw, th;
-    SDL_QueryTexture(tex, nullptr, nullptr, &tw, &th);
-    SDL_Rect dst{x, y, tw, th};
-    SDL_RenderCopy(renderer_, tex, nullptr, &dst);
-    SDL_DestroyTexture(tex);
-    y += th + 2;
+    auto render_line = [&](const std::string& line) {
+        SDL_Surface* surf = TTF_RenderUTF8_Blended(font_, line.c_str(), color);
+        if (!surf) { y += step(); return; }
+        SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer_, surf);
+        int tw = surf->w, th = surf->h;
+        SDL_FreeSurface(surf);
+        if (!tex) { y += step(); return; }
+        SDL_Rect dst{x, y, tw, th};
+        SDL_RenderCopy(renderer_, tex, nullptr, &dst);
+        SDL_DestroyTexture(tex);
+        y += th + 2;
+    };
+
+    std::string current;
+    std::string word;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        char c = (i < text.size()) ? text[i] : ' ';
+        if (c != ' ') {
+            word.push_back(c);
+            continue;
+        }
+        if (word.empty()) continue;
+        std::string cand = current.empty() ? word : current + " " + word;
+        int tw = 0, th = 0;
+        TTF_SizeUTF8(font_, cand.c_str(), &tw, &th);
+        if (tw <= max_w || current.empty()) {
+            current = cand;
+        } else {
+            render_line(current);
+            current = word;
+        }
+        word.clear();
+    }
+    if (!current.empty()) render_line(current);
 }
 
 void Sidebar::draw_separator(int x, int y, int w) {
@@ -337,13 +362,18 @@ void Sidebar::render(const Graph& graph, NodeId selected,
             }
         }
 
+        int content_height = y - (content_top - scroll_px_);
+        int visible_height = std::max(0, h - content_top);
+        max_scroll_ = std::max(0, content_height - visible_height);
+        if (scroll_px_ > max_scroll_) scroll_px_ = max_scroll_;
+
         // Scroll indicator: small arrow at bottom if content overflows
-        if (y > h) {
+        if (max_scroll_ > 0 && scroll_px_ < max_scroll_) {
             SDL_Color arr{200, 200, 200, 255};
             int ay = h - line_h - 2;
             draw_text("v", x, ay, arr);
         }
-        if (scroll_px_ > 0) {
+        if (max_scroll_ > 0 && scroll_px_ > 0) {
             SDL_Color arr{200, 200, 200, 255};
             draw_text("^", x, content_top, arr);
         }

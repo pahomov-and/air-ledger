@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <algorithm>
 #include <sstream>
@@ -14,6 +15,67 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+
+static bool resolve_exec_path(const char* name_or_path, std::string& out) {
+    if (!name_or_path || !*name_or_path) return false;
+    if (std::strchr(name_or_path, '/')) {
+        if (::access(name_or_path, X_OK) == 0) {
+            out = name_or_path;
+            return true;
+        }
+        return false;
+    }
+    const char* path_env = std::getenv("PATH");
+    if (!path_env || !*path_env) return false;
+    std::string path(path_env);
+    size_t pos = 0;
+    while (true) {
+        size_t next = path.find(':', pos);
+        std::string dir = path.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        if (dir.empty()) dir = ".";
+        std::string cand = dir + "/" + name_or_path;
+        if (::access(cand.c_str(), X_OK) == 0) {
+            out = cand;
+            return true;
+        }
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    return false;
+}
+
+static std::string resolve_tool(const char* env_name, const char* default_name) {
+    const char* ov = std::getenv(env_name);
+    std::string p;
+    if (ov && *ov) {
+        if (resolve_exec_path(ov, p)) return p;
+        return std::string(ov) + " (missing)";
+    }
+    if (resolve_exec_path(default_name, p)) return p;
+    return std::string(default_name) + " (missing)";
+}
+
+static const char* iw_bin() {
+    const char* p = std::getenv("AIR_LEDGER_IW_BIN");
+    return (p && *p) ? p : "iw";
+}
+
+static const char* aireplay_bin() {
+    const char* p = std::getenv("AIR_LEDGER_AIREPLAY_BIN");
+    return (p && *p) ? p : "aireplay-ng";
+}
+
+static int autoscaled_font_size(int h) {
+    // Small displays (e.g. 400x240) need slightly larger text for readability.
+    if (h <= 260) return 13;
+    return std::clamp(8 + h / 80, 9, 32);
+}
+
+static int sidebar_width_for(int font_size, int win_w, int win_h) {
+    // Keep more graph area on tiny displays so bottom notifications have room.
+    int max_ratio = (win_w <= 500 || win_h <= 300) ? (win_w * 36 / 100) : (win_w * 2 / 5);
+    return std::min(font_size * 22, max_ratio);
+}
 
 // Candidate font paths to try (bundled font is tried first)
 static const char* FONT_PATHS[] = {
@@ -79,7 +141,7 @@ void App::resize_font(int delta) {
     font_size_ = new_size;
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(window_, &win_w, &win_h);
-    sidebar_w_ = std::min(font_size_ * 22, win_w * 2 / 5);
+    sidebar_w_ = sidebar_width_for(font_size_, win_w, win_h);
     if (font_) { TTF_CloseFont(font_); font_ = nullptr; }
     load_font();  // TTF_HINTING_MONO set inside load_font
     graph_view_.set_font(font_);
@@ -130,8 +192,8 @@ bool App::init(const std::string& iface, const std::string& db_path) {
     // Auto-scale font to screen size: comfortable on both Beepy (240px) and desktop
     int actual_w = win_surface->w;
     int actual_h = win_surface->h;
-    font_size_ = std::clamp(8 + actual_h / 80, 9, 32);
-    sidebar_w_ = std::min(font_size_ * 22, actual_w * 2 / 5);
+    font_size_ = autoscaled_font_size(actual_h);
+    sidebar_w_ = sidebar_width_for(font_size_, actual_w, actual_h);
 
     load_font();
 
@@ -153,6 +215,20 @@ bool App::init(const std::string& iface, const std::string& db_path) {
     db_.create_schema();
     db_.load_graph(graph_);
     last_saved_node_count_ = graph_.nodes().size();
+
+    // Resolve and print external utilities once at startup.
+    std::string hc = resolve_tool("AIR_LEDGER_HASHCAT_BIN", "hashcat");
+    std::string ac = resolve_tool("AIR_LEDGER_AIRCRACK_BIN", "aircrack-ng");
+    std::string ar = resolve_tool("AIR_LEDGER_AIREPLAY_BIN", "aireplay-ng");
+    std::string iw = resolve_tool("AIR_LEDGER_IW_BIN", "iw");
+    std::fprintf(stderr, "[tools] hashcat:   %s\n", hc.c_str());
+    std::fprintf(stderr, "[tools] aircrack:  %s\n", ac.c_str());
+    std::fprintf(stderr, "[tools] aireplay:  %s\n", ar.c_str());
+    std::fprintf(stderr, "[tools] iw:        %s\n", iw.c_str());
+    push_notice("tool hashcat: " + hc, 8'000'000ULL);
+    push_notice("tool aircrack: " + ac, 8'000'000ULL);
+    push_notice("tool aireplay: " + ar, 8'000'000ULL);
+    push_notice("tool iw: " + iw, 8'000'000ULL);
 
     // Capture
     capture_ = std::make_unique<PcapSource>();
@@ -340,10 +416,7 @@ void App::process_pending_frames() {
         }
         // Show notification for critical events
         if (ev.severity >= 3) {
-            notifications_.push_back({
-                std::string("[!] ") + ev.description,
-                true, now_us() + 8'000'000ULL
-            });
+            push_error(std::string("[!] ") + ev.description);
         }
     }
 }
@@ -390,8 +463,7 @@ void App::run_analytics() {
         // Count stored handshakes and show in notification
         int n = db_.handshake_count(h.bssid);
         std::string label = h.ssid.empty() ? h.bssid : h.ssid;
-        notifications_.push_back({"HS#" + std::to_string(n) + ": " + label,
-                                   false, now_us() + 6'000'000ULL});
+        push_notice("HS#" + std::to_string(n) + ": " + label, 6'000'000ULL);
     }
 
     // Check if cracker has found any passwords (or exhausted the wordlist)
@@ -421,7 +493,7 @@ void App::run_analytics() {
                 std::ofstream pf(passwords_file_, std::ios::app);
                 if (pf) pf << r.bssid << "\t" << ssid << "\t" << r.password << "\n";
             }
-            notifications_.push_back({"PW: " + r.bssid + " = " + r.password, false, now_us() + 10'000'000ULL});
+            push_notice("PW: " + r.bssid + " = " + r.password, 10'000'000ULL);
             std::fprintf(stderr, "[app] password saved: %s → '%s'\n",
                          r.bssid.c_str(), r.password.c_str());
         } else {
@@ -434,7 +506,7 @@ void App::run_analytics() {
                 }
             }
             std::string label = r.ssid.empty() ? r.bssid : r.ssid;
-            notifications_.push_back({"No key: " + label, false, now_us() + 8'000'000ULL});
+            push_notice("No key: " + label, 8'000'000ULL);
             std::fprintf(stderr, "[app] crack exhausted (no key): %s\n", r.bssid.c_str());
         }
     }
@@ -448,12 +520,24 @@ void App::handle_click(int sx, int sy) {
 
 void App::push_error(const std::string& msg) {
     std::fprintf(stderr, "[error] %s\n", msg.c_str());
+    add_event_log(msg, {255, 60, 60, 255});
     notifications_.push_back({msg, true, now_us() + 5'000'000ULL});
 }
 
 void App::push_warning(const std::string& msg) {
     std::fprintf(stderr, "[warn] %s\n", msg.c_str());
+    add_event_log(msg, {255, 220, 60, 255});
     notifications_.push_back({msg, false, now_us() + 4'000'000ULL});
+}
+
+void App::push_notice(const std::string& msg, uint64_t ttl_us) {
+    add_event_log(msg, {0, 255, 100, 255});
+    notifications_.push_back({msg, false, now_us() + ttl_us});
+}
+
+void App::add_event_log(const std::string& msg, SDL_Color color) {
+    event_log_.insert(event_log_.begin(), {msg, color});
+    if (event_log_.size() > EVENT_LOG_MAX) event_log_.resize(EVENT_LOG_MAX);
 }
 
 
@@ -467,9 +551,13 @@ void App::send_deauth(NodeId ap_id) {
     // when the AP sends M1 (the reconnection happens ~100-500ms after deauth).
     // The lock also serialises with the hopper thread via ch_mutex_ in set_channel().
     if (hopper_ && n->channel > 0) {
-        hopper_->lock_channel(n->channel, n->chan_ht_oper);
-        deauth_ch_unlock_us_ = now_us() + 5'000'000ULL; // 5 s — enough for full 4-way HS
-        std::fprintf(stderr, "[deauth] channel locked to %d for 5s (pre-deauth)\n", n->channel);
+        if (hopper_->lock_channel(n->channel, n->chan_ht_oper)) {
+            deauth_ch_unlock_us_ = now_us() + 5'000'000ULL; // 5 s — enough for full 4-way HS
+            std::fprintf(stderr, "[deauth] channel locked to %d for 5s (pre-deauth)\n", n->channel);
+        } else {
+            push_warning("Channel lock failed for " + bssid + " (ch " + std::to_string(n->channel) + ")");
+            std::fprintf(stderr, "[deauth] channel lock FAILED for %s ch=%d\n", bssid.c_str(), n->channel);
+        }
     }
 
     if (deauth_engine_ == DeauthEngine::Builtin) {
@@ -479,8 +567,9 @@ void App::send_deauth(NodeId ap_id) {
         }).detach();
     } else {
         // Fallback: aireplay-ng in forked child
-        std::fprintf(stderr, "[deauth] aireplay-ng -0 5 -a %s %s\n",
-                     bssid.c_str(), iface_name_.c_str());
+        const char* aireplay = aireplay_bin();
+        std::fprintf(stderr, "[deauth] %s -0 5 -a %s %s\n",
+                     aireplay, bssid.c_str(), iface_name_.c_str());
         signal(SIGCHLD, SIG_IGN);
         pid_t pid = fork();
         if (pid == 0) {
@@ -491,10 +580,10 @@ void App::send_deauth(NodeId ap_id) {
                 close(devnull);
             }
             const char* av[] = {
-                "aireplay-ng", "-0", "5", "-a", bssid.c_str(),
+                aireplay, "-0", "5", "-a", bssid.c_str(),
                 iface_name_.c_str(), nullptr
             };
-            execvp("aireplay-ng", const_cast<char* const*>(av));
+            execvp(aireplay, const_cast<char* const*>(av));
             _exit(1);
         }
     }
@@ -602,8 +691,12 @@ void App::apply_selection_channel_lock(NodeId selected) {
             if (ap_node) lock_ht = ap_node->chan_ht_oper;
         }
     }
-    if (lock_ch > 0) hopper_->lock_channel(lock_ch, lock_ht);
-    else if (hopping_enabled_) hopper_->unlock();
+    if (lock_ch > 0) {
+        if (!hopper_->lock_channel(lock_ch, lock_ht))
+            push_warning("Channel lock failed (ch " + std::to_string(lock_ch) + ")");
+    } else if (hopping_enabled_) {
+        hopper_->unlock();
+    }
 }
 
 void App::toggle_channel_hopping() {
@@ -637,8 +730,9 @@ void App::reset_iface() {
     // Bring the interface down, restore monitor mode, then bring up
     {
         struct timespec ts300{0, 300'000'000};
+        const char* iw = iw_bin();
         std::string dn  = "ip link set " + iface_name_ + " down 2>/dev/null";
-        std::string mon = "iw dev " + iface_name_ + " set type monitor 2>/dev/null";
+        std::string mon = std::string(iw) + " dev " + iface_name_ + " set type monitor 2>/dev/null";
         std::string up  = "ip link set " + iface_name_ + " up 2>/dev/null";
         system(dn.c_str());
         nanosleep(&ts300, nullptr);
@@ -1087,7 +1181,7 @@ void App::run() {
                     // First valid resize: recalculate font size (window was 1×1 at init)
                     if (!initial_resize_done_ && cur_w > 1 && cur_h > 1) {
                         initial_resize_done_ = true;
-                        font_size_ = std::clamp(8 + cur_h / 80, 9, 32);
+                        font_size_ = autoscaled_font_size(cur_h);
                         if (font_) { TTF_CloseFont(font_); font_ = nullptr; }
                         load_font();
                         graph_view_.set_font(font_);
@@ -1095,7 +1189,7 @@ void App::run() {
                         std::fprintf(stderr, "[app] initial resize: %dx%d  font: %dpx\n",
                                      cur_w, cur_h, font_size_);
                     }
-                    sidebar_w_ = std::min(font_size_ * 22, cur_w * 2 / 5);
+                    sidebar_w_ = sidebar_width_for(font_size_, cur_w, cur_h);
                     int gw = cur_w - sidebar_w_;
                     graph_view_.set_viewport(0, 0, gw, cur_h);
                     layout_.set_bounds(static_cast<float>(gw), static_cast<float>(cur_h));
@@ -1136,14 +1230,24 @@ void App::run() {
                     }
                 } else if (graph_view_.crack_list_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
-                    if (sym == SDLK_ESCAPE) {
+                    if (sym == SDLK_ESCAPE || sym == SDLK_k) {
                         graph_view_.close_crack_list();
+                    } else if (sym == SDLK_UP) {
+                        graph_view_.crack_list_move(-1);
+                    } else if (sym == SDLK_DOWN) {
+                        graph_view_.crack_list_move(+1);
                     } else if (sym == SDLK_TAB) {
                         graph_view_.crack_list_move(shift ? -1 : +1);
+                    } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+                        NodeId sid = graph_view_.sidebar_focus_node(graph_);
+                        if (sid) graph_view_.select_and_focus(sid, graph_);
                     }
                 } else if (graph_view_.hs_list_visible()) {
-                    if (sym == SDLK_ESCAPE) {
+                    bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    if (sym == SDLK_ESCAPE || sym == SDLK_j) {
                         graph_view_.close_hs_list();
+                    } else if (sym == SDLK_TAB) {
+                        graph_view_.hs_list_move(shift ? -1 : +1);
                     } else if (sym == SDLK_UP) {
                         graph_view_.hs_list_move(-1);
                     } else if (sym == SDLK_DOWN) {
@@ -1155,10 +1259,25 @@ void App::run() {
                             graph_view_.select_and_focus(cid, graph_);
                         }
                     }
+                } else if (graph_view_.event_log_visible()) {
+                    if (sym == SDLK_ESCAPE || sym == SDLK_y) {
+                        graph_view_.close_event_log();
+                    } else if (sym == SDLK_TAB) {
+                        bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                        graph_view_.event_log_move(shift ? -1 : +1);
+                    } else if (sym == SDLK_UP) {
+                        graph_view_.event_log_move(-1);
+                    } else if (sym == SDLK_DOWN) {
+                        graph_view_.event_log_move(+1);
+                    }
                 } else if (graph_view_.ap_list_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
-                    if (sym == SDLK_ESCAPE) {
+                    if (sym == SDLK_ESCAPE || sym == SDLK_p) {
                         graph_view_.close_ap_list();
+                    } else if (sym == SDLK_UP) {
+                        graph_view_.ap_list_move(-1, graph_);
+                    } else if (sym == SDLK_DOWN) {
+                        graph_view_.ap_list_move(+1, graph_);
                     } else if (sym == SDLK_TAB) {
                         graph_view_.ap_list_move(shift ? -1 : +1, graph_);
                     } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
@@ -1171,6 +1290,20 @@ void App::run() {
                         NodeId ap_id = graph_view_.ap_list_cursor_node(graph_);
                         if (ap_id) send_deauth(ap_id);
                     }
+                } else if (graph_view_.anomaly_log_visible()) {
+                    bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    if (sym == SDLK_ESCAPE || sym == SDLK_w) {
+                        graph_view_.close_anomaly_log();
+                    } else if (sym == SDLK_UP) {
+                        graph_view_.anomaly_log_move(-1);
+                    } else if (sym == SDLK_DOWN) {
+                        graph_view_.anomaly_log_move(+1);
+                    } else if (sym == SDLK_TAB) {
+                        graph_view_.anomaly_log_move(shift ? -1 : +1);
+                    } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+                        NodeId sid = graph_view_.sidebar_focus_node(graph_);
+                        if (sid) graph_view_.select_and_focus(sid, graph_);
+                    }
                 } else {
                     if (sym == SDLK_ESCAPE) { graph_view_.deselect(); }
                     if (sym == SDLK_q)      { stop(); break; }
@@ -1178,23 +1311,29 @@ void App::run() {
                     if (sym == SDLK_k)      { graph_view_.toggle_crack_list(); }
                     if (sym == SDLK_j)      { refresh_hs_list(); graph_view_.toggle_hs_list(); }
                     if (sym == SDLK_TAB) {
-                        // Tab cycles only AP nodes
-                        std::vector<NodeId> ids;
-                        for (auto& [id, n] : graph_.nodes())
-                            if (n.type == NodeType::AP) ids.push_back(id);
-                        std::sort(ids.begin(), ids.end());
-                        if (!ids.empty()) {
-                            auto it = std::find(ids.begin(), ids.end(), selected_node);
-                            bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
-                            if (it == ids.end()) {
-                                graph_view_.select_and_focus(ids[0], graph_);
-                            } else if (shift) {
-                                graph_view_.select_and_focus(
-                                    it == ids.begin() ? ids.back() : *std::prev(it), graph_);
-                            } else {
-                                auto next = std::next(it);
-                                graph_view_.select_and_focus(
-                                    next == ids.end() ? ids.front() : *next, graph_);
+                        bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                        bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
+                        if (ctrl) {
+                            // Sidebar circular scroll: Ctrl+Tab forward, Ctrl+Shift+Tab backward
+                            sidebar_.cycle_scroll(shift);
+                        } else {
+                            // Tab cycles only AP nodes
+                            std::vector<NodeId> ids;
+                            for (auto& [id, n] : graph_.nodes())
+                                if (n.type == NodeType::AP) ids.push_back(id);
+                            std::sort(ids.begin(), ids.end());
+                            if (!ids.empty()) {
+                                auto it = std::find(ids.begin(), ids.end(), selected_node);
+                                if (it == ids.end()) {
+                                    graph_view_.select_and_focus(ids[0], graph_);
+                                } else if (shift) {
+                                    graph_view_.select_and_focus(
+                                        it == ids.begin() ? ids.back() : *std::prev(it), graph_);
+                                } else {
+                                    auto next = std::next(it);
+                                    graph_view_.select_and_focus(
+                                        next == ids.end() ? ids.front() : *next, graph_);
+                                }
                             }
                         }
                     }
@@ -1236,6 +1375,7 @@ void App::run() {
                     if (sym == SDLK_SLASH) { start_search(); }
                     if (sym == SDLK_i)     { graph_view_.toggle_help(); }
                     if (sym == SDLK_w)     { graph_view_.toggle_anomaly_log(); }
+                    if (sym == SDLK_y)     { graph_view_.toggle_event_log(); }
                     if (sym == SDLK_SPACE) { graph_view_.help_page_next(); }
                     // Camera controls
                     if (sym == SDLK_z)      { graph_view_.zoom_center(1.15f); }
@@ -1365,6 +1505,7 @@ void App::run() {
         graph_view_.set_filter(filter_);
         graph_view_.set_pw_count(pw_count_);
         graph_view_.set_anomaly_log(anomaly_log_);
+        graph_view_.set_event_log(event_log_);
         {
             auto cs = handshake_saver_.current_crack_status();
             graph_view_.set_crack_info({cs.ssid, cs.speed_kps, aggressive_mode_, aggr_target_label_, cs.engine_label});
@@ -1451,9 +1592,8 @@ void App::run() {
         int graph_w = cur_w - sidebar_w_;
         graph_view_.render(graph_, graph_w, cur_h);
         // When AP list is open, show info for the highlighted AP in sidebar
-        NodeId sidebar_node = graph_view_.ap_list_visible()
-            ? graph_view_.ap_list_cursor_node(graph_)
-            : selected_node;
+        NodeId sidebar_node = graph_view_.sidebar_focus_node(graph_);
+        if (sidebar_node == 0) sidebar_node = selected_node;
         sidebar_.render(graph_, sidebar_node, graph_w, sidebar_w_, cur_h,
                         filter_, alias_mode_, alias_buf_, alias_target_,
                         total_frames_, stats_beacon_, stats_probe_req_,

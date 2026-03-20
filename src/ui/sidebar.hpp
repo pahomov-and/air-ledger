@@ -11,8 +11,18 @@ public:
     void set_font(TTF_Font* font) { font_ = font; }
     void set_renderer(SDL_Renderer* r) { renderer_ = r; }
     void scroll_up()   { int s = step(); scroll_px_ = std::max(0, scroll_px_ - s); }
-    void scroll_down() { int s = step(); scroll_px_ += s; }
+    void scroll_down() { int s = step(); scroll_px_ = std::min(max_scroll_, scroll_px_ + s); }
     void reset_scroll() { scroll_px_ = 0; }
+    void cycle_scroll(bool backward) {
+        int s = std::max(step() * 4, 40);
+        if (backward) {
+            if (scroll_px_ <= 0) scroll_px_ = max_scroll_;
+            else scroll_px_ = std::max(0, scroll_px_ - s);
+        } else {
+            if (scroll_px_ >= max_scroll_) scroll_px_ = 0;
+            else scroll_px_ = std::min(max_scroll_, scroll_px_ + s);
+        }
+    }
     void render(const Graph& graph, NodeId selected, int sidebar_x, int w, int h,
                 const FilterState& filter, bool alias_mode,
                 const std::string& alias_buf, NodeId alias_target,
@@ -26,6 +36,7 @@ private:
     TTF_Font* font_{nullptr};
     int w_{200};  // current sidebar width, set each render()
     int scroll_px_{0};
+    int max_scroll_{0};
 
     int step() const { return font_ ? TTF_FontHeight(font_) + 2 : 16; }
 

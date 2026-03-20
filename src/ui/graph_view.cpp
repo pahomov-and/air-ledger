@@ -5,6 +5,7 @@
 #include <format>
 #include <cctype>
 #include <chrono>
+#include <sstream>
 
 // Regular (non-ghost) SSID nodes are hidden — the AP label carries the SSID name.
 // Clients belonging to collapsed AP groups are also hidden.
@@ -560,6 +561,12 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
         return;
     }
 
+    // Event log overlay
+    if (show_event_log_) {
+        draw_event_log();
+        return;
+    }
+
     // Aggressive mode indicator — top-left, red/orange (blinks)
     if (font_ && crack_info_.aggressive) {
         bool blink_on = (SDL_GetTicks() / 500) % 2 == 0;
@@ -633,6 +640,7 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
         };
 
         int lh = TTF_FontHeight(font_);
+        bool compact_ui = (vp_w_ <= 320 || vp_h_ <= 260);
 
         if (show_help_) {
             // Semi-transparent dark background covering the graph area
@@ -661,6 +669,7 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                 " k          crack queue overlay",
                 " j          handshake list",
                 " w          anomaly log",
+                " y          event log",
                 " i          help toggle",
                 " [space]    next page",
                 "-",
@@ -772,31 +781,65 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
         } else {
             // Notifications stack above the hint line (newest at bottom)
             if (font_ && !notifications_.empty()) {
-                int ny = vp_y_ + vp_h_ - lh - 2 - static_cast<int>(notifications_.size()) * (lh + 2);
-                for (auto& notif : notifications_) {
-                    SDL_Surface* ns = TTF_RenderUTF8_Blended(font_, notif.text.c_str(), notif.color);
-                    if (ns) {
+                int max_chars = std::max(16, (vp_w_ - 14) / std::max(5, lh / 2));
+                int max_notifs = compact_ui ? 2 : 4;
+                int start = std::max(0, static_cast<int>(notifications_.size()) - max_notifs);
+                int ny = vp_y_ + vp_h_ - lh - 2;
+                auto wrap_lines = [&](const std::string& text) {
+                    std::vector<std::string> out;
+                    std::string cur;
+                    std::istringstream iss(text);
+                    std::string w;
+                    while (iss >> w) {
+                        std::string cand = cur.empty() ? w : (cur + " " + w);
+                        if (static_cast<int>(cand.size()) <= max_chars) {
+                            cur = cand;
+                        } else {
+                            if (!cur.empty()) out.push_back(cur);
+                            if (static_cast<int>(w.size()) > max_chars) {
+                                out.push_back(w.substr(0, static_cast<size_t>(max_chars - 1)) + "~");
+                                cur.clear();
+                            } else {
+                                cur = w;
+                            }
+                        }
+                    }
+                    if (!cur.empty()) out.push_back(cur);
+                    if (out.empty()) out.push_back("");
+                    if (compact_ui && out.size() > 2) {
+                        out.resize(2);
+                        if (!out.back().empty()) out.back().back() = '~';
+                    }
+                    return out;
+                };
+                for (int i = static_cast<int>(notifications_.size()) - 1; i >= start; --i) {
+                    auto lines = wrap_lines(notifications_[i].text);
+                    ny -= static_cast<int>(lines.size()) * (lh + 2);
+                    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+                    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+                    SDL_Rect bg{vp_x_ + 2, ny - 1, vp_w_ - 6, static_cast<int>(lines.size()) * (lh + 2) + 2};
+                    SDL_RenderFillRect(renderer_, &bg);
+                    int ly = ny;
+                    for (const auto& line : lines) {
+                        SDL_Surface* ns = TTF_RenderUTF8_Blended(font_, line.c_str(), notifications_[i].color);
+                        if (!ns) continue;
                         SDL_Texture* nt = SDL_CreateTextureFromSurface(renderer_, ns);
                         int tw = ns->w, th = ns->h;
                         SDL_FreeSurface(ns);
-                        if (nt) {
-                            // Dark background behind text for readability
-                            SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-                            SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 180);
-                            SDL_Rect bg{vp_x_ + 2, ny - 1, tw + 4, th + 2};
-                            SDL_RenderFillRect(renderer_, &bg);
-                            SDL_Rect dst{vp_x_ + 4, ny, tw, th};
-                            SDL_RenderCopy(renderer_, nt, nullptr, &dst);
-                            SDL_DestroyTexture(nt);
-                        }
+                        if (!nt) continue;
+                        SDL_Rect dst{vp_x_ + 4, ly, tw, th};
+                        SDL_RenderCopy(renderer_, nt, nullptr, &dst);
+                        SDL_DestroyTexture(nt);
+                        ly += lh + 2;
                     }
-                    ny += lh + 2;
+                    ny -= 2;
                 }
             }
 
             int hint_y = vp_y_ + vp_h_ - lh - 2;
             SDL_Color dim{200, 200, 200, 255};
-            draw_line("i=help p=ap k=crk j=hs w=warn g=agg", vp_x_ + 4, hint_y, dim);
+            draw_line(compact_ui ? "i p k j w y g" : "i=help p=ap k=crk j=hs w=warn y=log g=agg",
+                      vp_x_ + 4, hint_y, dim);
 
             // c=collapse/expand hint when an AP is focused
             if (ap_focus_id_ != 0) {
@@ -821,7 +864,7 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                 SDL_Color dcol = deauth_flash_
                     ? SDL_Color{255, 0, 0, 255}
                     : SDL_Color{255, 255, 0, 255};
-                const char* dtxt = deauth_flash_ ? "DEAUTH SENT!" : "d=deauth";
+                const char* dtxt = deauth_flash_ ? "DEAUTH!" : "d=deauth";
                 SDL_Surface* ds = TTF_RenderUTF8_Blended(font_, dtxt, dcol);
                 if (ds) {
                     SDL_Texture* dt = SDL_CreateTextureFromSurface(renderer_, ds);
@@ -972,6 +1015,12 @@ static std::vector<NodeId> build_ap_list(const Graph& graph) {
     return ids;
 }
 
+static std::string clamp_line_chars(const std::string& s, int max_chars) {
+    if (max_chars < 4) return s;
+    if (static_cast<int>(s.size()) <= max_chars) return s;
+    return s.substr(0, static_cast<size_t>(max_chars - 1)) + "~";
+}
+
 void GraphView::ap_list_move(int delta, const Graph& g) {
     auto ids = build_ap_list(g);
     if (ids.empty()) return;
@@ -999,6 +1048,7 @@ void GraphView::draw_ap_list(const Graph& graph) {
     int pad  = 4;
     int row  = lh + 2;
     int y    = vp_y_ + 8;
+    int max_chars = std::max(16, (vp_w_ - 12) / std::max(5, lh / 2));
 
     // Header
     auto draw_text = [&](const char* txt, int x, int yy, SDL_Color col) {
@@ -1079,6 +1129,7 @@ void GraphView::draw_ap_list(const Graph& graph) {
         SDL_Color col = is_cur  ? SDL_Color{255, 255,   0, 255}   // yellow cursor
                       : has_pw  ? SDL_Color{  0, 255,   0, 255}   // green = cracked
                       :           SDL_Color{255, 255, 255, 255};
+        line = clamp_line_chars(line, max_chars);
         draw_text(line.c_str(), vp_x_ + pad, y, col);
         y += row;
     }
@@ -1094,15 +1145,21 @@ void GraphView::draw_ap_list(const Graph& graph) {
         SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
         SDL_RenderDrawLine(renderer_, vp_x_, footer_y, vp_x_ + vp_w_, footer_y);
     }
-    SDL_Color hint_col{160, 160, 160, 255};
-    draw_text("Tab/sTab=nav  Ent=sel", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
-    draw_text("d=deauth  Esc=close",   vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2),     hint_col);
+    SDL_Color hint_col{220, 220, 220, 255};
+    draw_text("Up/Dn Tab/sTab nav", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
+    draw_text("Enter=sel d=deauth p/Esc", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), hint_col);
 }
 
 void GraphView::crack_list_move(int delta) {
     if (crack_list_entries_.empty()) return;
     crack_list_cursor_ = static_cast<int>(
         (crack_list_cursor_ + delta + crack_list_entries_.size()) % crack_list_entries_.size());
+}
+
+const GraphView::CrackListEntry* GraphView::crack_list_current() const {
+    if (crack_list_entries_.empty()) return nullptr;
+    int i = std::clamp(crack_list_cursor_, 0, static_cast<int>(crack_list_entries_.size()) - 1);
+    return &crack_list_entries_[i];
 }
 
 void GraphView::draw_crack_list() {
@@ -1117,6 +1174,7 @@ void GraphView::draw_crack_list() {
     int pad = 4;
     int row = lh + 2;
     int y   = vp_y_ + 8;
+    int max_chars = std::max(16, (vp_w_ - 12) / std::max(5, lh / 2));
 
     auto draw_text = [&](const char* txt, int x, int yy, SDL_Color col) {
         SDL_Surface* s = TTF_RenderUTF8_Blended(font_, txt, col);
@@ -1200,6 +1258,7 @@ void GraphView::draw_crack_list() {
                 line += "=" + e.password;
 
             SDL_Color row_col = is_cur ? SDL_Color{255, 255, 0, 255} : status_col;
+            line = clamp_line_chars(line, max_chars);
             draw_text(line.c_str(), vp_x_ + pad, y, row_col);
             y += row;
         }
@@ -1215,15 +1274,27 @@ void GraphView::draw_crack_list() {
         SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
         SDL_RenderDrawLine(renderer_, vp_x_, footer_y, vp_x_ + vp_w_, footer_y);
     }
-    SDL_Color hint_col{160, 160, 160, 255};
-    draw_text("Tab/sTab=nav", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
-    draw_text("Esc=close", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), hint_col);
+    SDL_Color hint_col{220, 220, 220, 255};
+    draw_text("Up/Dn Tab/sTab nav", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
+    draw_text("Enter=select AP k/Esc", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), hint_col);
 }
 
 void GraphView::hs_list_move(int delta) {
     if (hs_list_entries_.empty()) return;
     int n = static_cast<int>(hs_list_entries_.size());
     hs_list_cursor_ = (hs_list_cursor_ + delta % n + n) % n;
+}
+
+void GraphView::anomaly_log_move(int delta) {
+    if (anomaly_log_.empty()) return;
+    int n = static_cast<int>(anomaly_log_.size());
+    anomaly_cursor_ = (anomaly_cursor_ + delta + n) % n;
+}
+
+const AnomalyEvent* GraphView::anomaly_log_current() const {
+    if (anomaly_log_.empty()) return nullptr;
+    int i = std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1);
+    return &anomaly_log_[i];
 }
 
 NodeId GraphView::hs_list_select_client() const {
@@ -1244,6 +1315,7 @@ void GraphView::draw_hs_list() {
     int pad = 4;
     int row = lh + 2;
     int y   = vp_y_ + 8;
+    int max_chars = std::max(16, (vp_w_ - 12) / std::max(5, lh / 2));
 
     auto draw_text = [&](const char* txt, int x, int yy, SDL_Color col) {
         SDL_Surface* s = TTF_RenderUTF8_Blended(font_, txt, col);
@@ -1328,6 +1400,7 @@ void GraphView::draw_hs_list() {
                 line += "=" + e.password;
 
             SDL_Color row_col = is_cur ? SDL_Color{255, 255, 0, 255} : status_col;
+            line = clamp_line_chars(line, max_chars);
             draw_text(line.c_str(), vp_x_ + pad, y, row_col);
             y += row;
         }
@@ -1343,9 +1416,9 @@ void GraphView::draw_hs_list() {
         SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
         SDL_RenderDrawLine(renderer_, vp_x_, footer_y, vp_x_ + vp_w_, footer_y);
     }
-    SDL_Color hint_col{160, 160, 160, 255};
-    draw_text("Up/Dn=nav  Enter=select client", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
-    draw_text("Esc=close", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), hint_col);
+    SDL_Color hint_col{220, 220, 220, 255};
+    draw_text("Up/Dn Tab/sTab nav", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
+    draw_text("Enter=select j/Esc", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), hint_col);
 }
 
 void GraphView::fit_view(const Graph& graph) {
@@ -1384,6 +1457,7 @@ void GraphView::draw_anomaly_log() {
     int pad = 4;
     int row = lh + 2;
     int y   = vp_y_ + 8;
+    int max_chars = std::max(16, (vp_w_ - 12) / std::max(5, lh / 2));
 
     auto draw_text = [&](const char* txt, int x, int yy, SDL_Color col) {
         SDL_Surface* s = TTF_RenderUTF8_Blended(font_, txt, col);
@@ -1408,11 +1482,13 @@ void GraphView::draw_anomaly_log() {
     if (anomaly_log_.empty()) {
         draw_text("No anomalies detected yet.", vp_x_ + pad, y, {180, 180, 180, 255});
     } else {
-        int footer_h = row + 4;
+        int footer_h = (lh + 2) * 2 + 2;
         int visible  = (vp_y_ + vp_h_ - y - footer_h) / row;
         if (visible < 1) visible = 1;
-
-        for (int i = 0; i < (int)anomaly_log_.size() && i < visible; ++i) {
+        int cursor = std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1);
+        int scroll = (cursor >= visible / 2) ? (cursor - visible / 2) : 0;
+        int used = 0;
+        for (int i = scroll; i < (int)anomaly_log_.size() && used < visible; ++i) {
             const auto& ev = anomaly_log_[i];
 
             // Severity color: critical=red, warn=yellow, info=white
@@ -1429,22 +1505,29 @@ void GraphView::draw_anomaly_log() {
                                 : age_s < 3600 ? std::format("{}m", age_s / 60)
                                 :                std::format("{}h", age_s / 3600);
 
-            // "[type] src → description  (age)"
+            bool is_cur = (i == cursor);
+            if (is_cur) {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer_, 60, 40, 20, 255);
+                SDL_Rect hl{vp_x_, y - 1, vp_w_, lh + 2};
+                SDL_RenderFillRect(renderer_, &hl);
+            }
+
+            // "[type] src age"
             std::string line = std::format("[{}] {} {}",
                 anomaly_type_name(ev.type),
                 ev.src_mac.size() >= 8 ? ev.src_mac.substr(ev.src_mac.size() - 8) : ev.src_mac,
                 age_str);
+            line = clamp_line_chars(line, max_chars);
             draw_text(line.c_str(), vp_x_ + pad, y, col);
             y += row;
 
             // Description on next line, dimmer
             std::string desc = ev.description;
-            if (desc.size() > 50) desc = desc.substr(0, 48) + "..";
+            desc = clamp_line_chars(desc, std::max(8, max_chars - 2));
             draw_text(("  " + desc).c_str(), vp_x_ + pad, y, {160, 160, 160, 255});
             y += row;
-
-            i++;  // each entry takes 2 lines
-            if (i >= visible) break;
+            used += 2;
         }
     }
 
@@ -1452,6 +1535,120 @@ void GraphView::draw_anomaly_log() {
     SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
     SDL_RenderDrawLine(renderer_, vp_x_, vp_y_ + vp_h_ - row - 6,
                        vp_x_ + vp_w_, vp_y_ + vp_h_ - row - 6);
-    draw_text("w=close  Orange ring=anomalous  Purple ring=multi-AP",
-              vp_x_ + pad, vp_y_ + vp_h_ - row - 4, {160, 160, 160, 255});
+    draw_text("Up/Dn Tab/sTab nav",
+              vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, {200, 200, 200, 255});
+    draw_text("Enter=select src w/Esc",
+              vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), {200, 200, 200, 255});
+}
+
+void GraphView::event_log_move(int delta) {
+    if (event_log_entries_.empty()) return;
+    int n = static_cast<int>(event_log_entries_.size());
+    event_log_cursor_ = (event_log_cursor_ + delta + n) % n;
+}
+
+const GraphView::EventLogEntry* GraphView::event_log_current() const {
+    if (event_log_entries_.empty()) return nullptr;
+    int i = std::clamp(event_log_cursor_, 0, static_cast<int>(event_log_entries_.size()) - 1);
+    return &event_log_entries_[i];
+}
+
+void GraphView::draw_event_log() {
+    if (!font_ || !renderer_) return;
+
+    SDL_Rect clip{vp_x_, vp_y_, vp_w_, vp_h_};
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+    SDL_RenderFillRect(renderer_, &clip);
+
+    int lh  = TTF_FontHeight(font_);
+    int pad = 4;
+    int row = lh + 2;
+    int y   = vp_y_ + 8;
+    bool compact_ui = (vp_w_ <= 320 || vp_h_ <= 260);
+    int max_chars = std::max(24, (vp_w_ - 2 * pad - 8) / std::max(5, lh / 2));
+    if (!compact_ui) max_chars = std::max(max_chars, 96);
+
+    auto draw_text = [&](const char* txt, int x, int yy, SDL_Color col) {
+        SDL_Surface* s = TTF_RenderUTF8_Blended(font_, txt, col);
+        if (!s) return;
+        SDL_Texture* t = SDL_CreateTextureFromSurface(renderer_, s);
+        int tw = s->w, th = s->h;
+        SDL_FreeSurface(s);
+        if (!t) return;
+        SDL_Rect dst{x, yy, tw, th};
+        SDL_RenderCopy(renderer_, t, nullptr, &dst);
+        SDL_DestroyTexture(t);
+    };
+
+    std::string hdr = std::format("EVENT LOG  ({})", event_log_entries_.size());
+    draw_text(hdr.c_str(), vp_x_ + pad, y, {120, 220, 255, 255});
+    y += row;
+    SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
+    SDL_RenderDrawLine(renderer_, vp_x_ + pad, y, vp_x_ + vp_w_ - pad, y);
+    y += 4;
+
+    int footer_h = (lh + 2) * 2 + 2;
+    int visible  = (vp_y_ + vp_h_ - y - footer_h) / row;
+    if (visible < 1) visible = 1;
+
+    if (event_log_entries_.empty()) {
+        draw_text("(no events yet)", vp_x_ + pad, y, {180, 180, 180, 255});
+    } else {
+        int cursor = std::clamp(event_log_cursor_, 0, static_cast<int>(event_log_entries_.size()) - 1);
+        int scroll = 0;
+        if (cursor >= visible) scroll = cursor - visible + 1;
+
+        for (int i = scroll; i < static_cast<int>(event_log_entries_.size()) && (i - scroll) < visible; ++i) {
+            const auto& e = event_log_entries_[i];
+            bool is_cur = (i == cursor);
+            if (is_cur) {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer_, 40, 60, 40, 255);
+                SDL_Rect hl{vp_x_, y - 1, vp_w_, lh + 2};
+                SDL_RenderFillRect(renderer_, &hl);
+            }
+            std::string line = e.text;
+            if (static_cast<int>(line.size()) > max_chars)
+                line = line.substr(0, static_cast<size_t>(max_chars - 1)) + "~";
+            SDL_Color col = is_cur ? SDL_Color{255, 255, 0, 255} : e.color;
+            draw_text(line.c_str(), vp_x_ + pad, y, col);
+            y += row;
+        }
+    }
+
+    {
+        int footer_y = vp_y_ + vp_h_ - (lh + 2) * 2 - 2;
+        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+        SDL_Rect bg{vp_x_, footer_y, vp_w_, vp_h_ - footer_y + vp_y_};
+        SDL_RenderFillRect(renderer_, &bg);
+        SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
+        SDL_RenderDrawLine(renderer_, vp_x_, footer_y, vp_x_ + vp_w_, footer_y);
+    }
+    SDL_Color hint_col{220, 220, 220, 255};
+    draw_text("Up/Dn Tab/sTab nav", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2) * 2, hint_col);
+    draw_text("y/Esc close", vp_x_ + pad, vp_y_ + vp_h_ - (lh + 2), hint_col);
+}
+
+NodeId GraphView::sidebar_focus_node(const Graph& graph) const {
+    if (show_ap_list_) return ap_list_cursor_node(graph);
+    if (show_hs_list_ && !hs_list_entries_.empty()) {
+        int i = std::clamp(hs_list_cursor_, 0, static_cast<int>(hs_list_entries_.size()) - 1);
+        NodeId apid = hs_list_entries_[i].ap_id;
+        return apid ? apid : hs_list_entries_[i].client_id;
+    }
+    if (show_crack_list_ && !crack_list_entries_.empty()) {
+        int i = std::clamp(crack_list_cursor_, 0, static_cast<int>(crack_list_entries_.size()) - 1);
+        const std::string& bssid = crack_list_entries_[i].bssid;
+        for (auto& [id, n] : graph.nodes())
+            if (n.type == NodeType::AP && n.label == bssid) return id;
+    }
+    if (show_anomaly_log_ && !anomaly_log_.empty()) {
+        int i = std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1);
+        const std::string& mac = anomaly_log_[i].src_mac;
+        for (auto& [id, n] : graph.nodes())
+            if (n.label == mac) return id;
+    }
+    return 0;
 }

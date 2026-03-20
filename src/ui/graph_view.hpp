@@ -62,12 +62,28 @@ public:
     bool crack_list_visible() const { return show_crack_list_; }
     void crack_list_move(int delta);
     void set_crack_list(const std::vector<CrackListEntry>& entries) { crack_list_entries_ = entries; }
+    const CrackListEntry* crack_list_current() const;
 
     // Anomaly log overlay (w key)
-    void toggle_anomaly_log() { show_anomaly_log_ = !show_anomaly_log_; }
+    void toggle_anomaly_log() { show_anomaly_log_ = !show_anomaly_log_; anomaly_cursor_ = 0; }
     void close_anomaly_log()  { show_anomaly_log_ = false; }
     bool anomaly_log_visible() const { return show_anomaly_log_; }
+    void anomaly_log_move(int delta);
+    const AnomalyEvent* anomaly_log_current() const;
     void set_anomaly_log(const std::vector<AnomalyEvent>& log) { anomaly_log_ = log; }
+
+    // Event log overlay (y key)
+    struct EventLogEntry {
+        std::string text;
+        SDL_Color   color{200, 200, 200, 255};
+    };
+    void toggle_event_log() { show_event_log_ = !show_event_log_; event_log_cursor_ = 0; }
+    void close_event_log()  { show_event_log_ = false; }
+    bool event_log_visible() const { return show_event_log_; }
+    void event_log_move(int delta);
+    void set_event_log(const std::vector<EventLogEntry>& entries) { event_log_entries_ = entries; }
+    const EventLogEntry* event_log_current() const;
+    NodeId sidebar_focus_node(const Graph& graph) const;
 
     // AP group focus / collapse
     void set_ap_focus(NodeId id) { ap_focus_id_ = id; }
@@ -170,6 +186,10 @@ private:
     std::vector<Notification> notifications_;
     bool show_anomaly_log_{false};
     std::vector<AnomalyEvent> anomaly_log_;
+    int  anomaly_cursor_{0};
+    bool show_event_log_{false};
+    int  event_log_cursor_{0};
+    std::vector<EventLogEntry> event_log_entries_;
 
     // Viewport rect in window coords
     int vp_x_{0}, vp_y_{0}, vp_w_{1200}, vp_h_{900};
@@ -189,6 +209,7 @@ private:
     void draw_crack_list();
     void draw_hs_list();
     void draw_anomaly_log();
+    void draw_event_log();
 
     float node_radius(const Node& n) const;
     SDL_Color node_color(const Node& n, bool active_boost, uint8_t alpha_override = 255) const;
