@@ -55,3 +55,9 @@ bool builtin_cracker_available();
 // Returns true if hashcat was found in PATH (runtime check).
 // Always returns false when HAVE_GPU_CRACK is not defined.
 bool hashcat_cracker_available();
+
+// Verify a known password against a (possibly new) handshake.
+// Returns true if the password still matches the handshake MIC.
+// Used to detect password change: if false, the AP was re-keyed.
+// Requires OpenSSL; always returns false if not compiled with HAVE_BUILTIN_CRACK.
+bool verify_wpa_password(const std::string& password, const WpaHandshake& hs);

@@ -3,12 +3,7 @@
 #include <cstring>
 #include <ctime>
 #include <chrono>
-#include <algorithm>
-#include <thread>
-#include <atomic>
-#include <mutex>
 #include <fstream>
-#include <memory>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -18,6 +13,7 @@
 #ifdef HAVE_OPENSSL
 #  include <openssl/evp.h>
 #  include <openssl/hmac.h>
+#  include <openssl/crypto.h>  // OPENSSL_fork_prepare/parent/child, OPENSSL_init_crypto
 #endif
 
 // ---------------------------------------------------------------------------
@@ -239,129 +235,97 @@ static bool verify_mic(const uint8_t ptk[64],
     return memcmp(computed, captured_mic, 16) == 0;
 }
 
-// Worker: reads lines from shared ifstream, computes PMK→PTK→MIC.
-// Uses total_tried counter for progress display.
-static void crack_worker(const WpaHandshake& hs,
-                          std::ifstream& file,
-                          std::mutex& file_mutex,
-                          std::atomic<bool>& found,
-                          std::atomic<uint64_t>& total_tried,
-                          std::mutex& result_mutex,
-                          std::string& result) {
-    uint8_t pmk[32], ptk[64];
-    std::string line;
-    while (!found.load(std::memory_order_relaxed)) {
-        {
-            std::lock_guard<std::mutex> lk(file_mutex);
-            if (!std::getline(file, line)) return; // EOF
-        }
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.size() < 8 || line.size() > 63) continue;
-
-        total_tried.fetch_add(1, std::memory_order_relaxed);
-
-        PKCS5_PBKDF2_HMAC(line.c_str(), static_cast<int>(line.size()),
-                           reinterpret_cast<const unsigned char*>(hs.ssid.c_str()),
-                           static_cast<int>(hs.ssid.size()),
-                           4096, EVP_sha1(), 32, pmk);
-        derive_ptk(pmk, hs.ap_mac, hs.client_mac, hs.anonce, hs.snonce, ptk);
-
-        if (verify_mic(ptk, hs.mic, hs.eapol_frame)) {
-            std::lock_guard<std::mutex> lk(result_mutex);
-            if (!found.exchange(true)) result = line;
-            return;
-        }
-    }
-}
-
-// Runs in the child process (after fork).
+// Runs in the child process (after fork) — single-threaded to avoid
+// std::thread+fork interactions. Writes progress every 3 seconds.
 static void run_builtin_child(const WpaHandshake& hs,
                                const std::vector<std::string>& wordlists,
                                const std::string& log_path) {
-    unsigned int n_threads = std::max(1u, std::thread::hardware_concurrency());
-    std::atomic<bool>     found{false};
-    std::atomic<uint64_t> total_tried{0};
-    std::mutex result_mutex;
+    struct sigaction sa{};
+    sa.sa_handler = [](int) {
+        const char msg[] = "[crack-child] SIGSEGV\n";
+        write(STDERR_FILENO, msg, sizeof(msg)-1);
+        _exit(2);
+    };
+    sigaction(SIGSEGV, &sa, nullptr);
+
+    bool found = false;
+    uint64_t total_tried = 0;
     std::string result;
 
     char bssid_str[18]; fmt_bssid(hs.ap_mac, bssid_str);
     const char* ssid_str = hs.ssid.empty() ? "<unknown>" : hs.ssid.c_str();
 
-    // Open log file at start so progress lines are readable by scan_log_for_speed()
     FILE* log = std::fopen(log_path.c_str(), "w");
 
-    std::fprintf(stderr, "[crack] builtin  AP: %s (%s)  threads: %u  wordlists: %zu\n",
-                 ssid_str, bssid_str, n_threads, wordlists.size());
+    std::fprintf(stderr, "[crack] builtin  AP: %s (%s)  wordlists: %zu\n",
+                 ssid_str, bssid_str, wordlists.size());
 
-    // Progress thread: writes speed in aircrack-ng format to log + stderr every 3 seconds
-    std::thread progress_thread([&]() {
-        auto t0 = std::chrono::steady_clock::now();
-        while (!found.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            if (found.load()) break;
-            double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t0).count();
-            uint64_t tried = total_tried.load();
-            uint64_t rate  = elapsed > 0.5 ? static_cast<uint64_t>(tried / elapsed) : 0;
-            int mins = static_cast<int>(elapsed) / 60;
-            int secs = static_cast<int>(elapsed) % 60;
-            // aircrack-ng-compatible format so scan_log_for_speed() can parse it
-            if (log) {
-                std::fprintf(log, "[%02d:%02d:%02d] %llu keys tested (%llu k/s)\n",
-                    0, mins, secs,
-                    static_cast<unsigned long long>(tried),
-                    static_cast<unsigned long long>(rate / 1000 + 1));
-                std::fflush(log);
+    uint8_t pmk[32], ptk[64];
+    auto t0 = std::chrono::steady_clock::now();
+    time_t last_progress = time(nullptr);
+
+    for (const auto& wl : wordlists) {
+        if (found) break;
+        std::ifstream file(wl);
+        if (!file.is_open()) {
+            std::fprintf(stderr, "[crack] skipping wordlist (not readable): %s\n", wl.c_str());
+            continue;
+        }
+        std::string line;
+        while (!found && std::getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size() < 8 || line.size() > 63) continue;
+
+            PKCS5_PBKDF2_HMAC(line.c_str(), static_cast<int>(line.size()),
+                               reinterpret_cast<const unsigned char*>(hs.ssid.c_str()),
+                               static_cast<int>(hs.ssid.size()),
+                               4096, EVP_sha1(), 32, pmk);
+            derive_ptk(pmk, hs.ap_mac, hs.client_mac, hs.anonce, hs.snonce, ptk);
+
+            if (verify_mic(ptk, hs.mic, hs.eapol_frame)) {
+                found  = true;
+                result = line;
+                break;
             }
-            std::fprintf(stderr,
-                "[crack] AP: %-24s (%s)  speed: %5llu PMK/s  tried: %9llu  elapsed: %dm%02ds\n",
-                ssid_str, bssid_str,
-                static_cast<unsigned long long>(rate),
-                static_cast<unsigned long long>(tried),
-                mins, secs);
-            std::fflush(stderr);
+            ++total_tried;
+
+            // Write progress every 3 seconds
+            time_t now = time(nullptr);
+            if (now - last_progress >= 3) {
+                double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                uint64_t rate = elapsed > 0.5 ? static_cast<uint64_t>(total_tried / elapsed) : 0;
+                int mins = static_cast<int>(elapsed) / 60;
+                int secs = static_cast<int>(elapsed) % 60;
+                if (log) {
+                    std::fprintf(log, "[%02d:%02d:%02d] %llu keys tested (%llu k/s)\n",
+                        0, mins, secs,
+                        static_cast<unsigned long long>(total_tried),
+                        static_cast<unsigned long long>(rate / 1000 + 1));
+                    std::fflush(log);
+                }
+                std::fprintf(stderr,
+                    "[crack] AP: %-24s (%s)  speed: %5llu PMK/s  tried: %9llu  elapsed: %dm%02ds\n",
+                    ssid_str, bssid_str,
+                    static_cast<unsigned long long>(rate),
+                    static_cast<unsigned long long>(total_tried),
+                    mins, secs);
+                last_progress = now;
+            }
         }
-    });
-    progress_thread.detach(); // killed automatically when _exit() is called
-
-    for (auto& wl : wordlists) {
-        if (found.load()) break;
-        if (!check_file_readable(wl.c_str(), "wordlist")) continue; // skip bad paths
-
-        auto file  = std::make_shared<std::ifstream>(wl);
-        auto fmut  = std::make_shared<std::mutex>();
-
-        std::vector<std::thread> threads;
-        threads.reserve(n_threads);
-        for (unsigned int t = 0; t < n_threads; ++t) {
-            threads.emplace_back(crack_worker,
-                                 std::cref(hs),
-                                 std::ref(*file), std::ref(*fmut),
-                                 std::ref(found), std::ref(total_tried),
-                                 std::ref(result_mutex), std::ref(result));
-        }
-        for (auto& t : threads) t.join();
     }
 
-    // Final status line
-    uint64_t tried = total_tried.load();
-    if (found.load())
+    if (found)
         std::fprintf(stderr, "[crack] KEY FOUND  AP: %s  tried: %llu\n",
-                     bssid_str, static_cast<unsigned long long>(tried));
+                     bssid_str, static_cast<unsigned long long>(total_tried));
     else
         std::fprintf(stderr, "[crack] KEY NOT FOUND  AP: %s  tried: %llu\n",
-                     bssid_str, static_cast<unsigned long long>(tried));
+                     bssid_str, static_cast<unsigned long long>(total_tried));
 
-    // Write final result to log (poll_results() reads this)
     if (!log) log = std::fopen(log_path.c_str(), "w");
-    if (!log) {
-        std::fprintf(stderr, "[crack] ERROR: cannot write log: %s\n", log_path.c_str());
-        _exit(1);
-    }
-    if (found.load())
-        std::fprintf(log, "KEY FOUND! [ %s ]\n", result.c_str());
-    else
-        std::fprintf(log, "KEY NOT FOUND.\n");
+    if (!log) { _exit(1); }
+    std::fprintf(log, found ? "KEY FOUND! [ %s ]\n" : "KEY NOT FOUND.\n",
+                 result.c_str());
     std::fclose(log);
     _exit(0);
 }
@@ -369,12 +333,13 @@ static void run_builtin_child(const WpaHandshake& hs,
 static bool run_builtin(const WpaHandshake& hs,
                          const std::vector<std::string>& wordlists,
                          const std::string& log_path) {
-    signal(SIGCHLD, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN); // auto-reap the crack child
     pid_t pid = fork();
     if (pid < 0) { perror("[crack] fork"); return false; }
-    if (pid != 0) return true; // parent: fork succeeded
+    if (pid != 0) return true; // parent
+    // Child process — run_builtin_child calls _exit, never returns
     run_builtin_child(hs, wordlists, log_path);
-    return true; // unreachable; child calls _exit()
+    _exit(0); // unreachable
 }
 
 #endif // HAVE_OPENSSL
@@ -617,6 +582,24 @@ static bool run_hashcat(const WpaHandshake& hs,
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+bool verify_wpa_password(const std::string& password, const WpaHandshake& hs) {
+#ifdef HAVE_OPENSSL
+    if (!hs.valid() || hs.eapol_frame.size() < 97) return false;
+    if (password.size() < 8 || password.size() > 63)  return false;
+    uint8_t pmk[32], ptk[64];
+    PKCS5_PBKDF2_HMAC(password.c_str(), static_cast<int>(password.size()),
+                      reinterpret_cast<const unsigned char*>(hs.ssid.c_str()),
+                      static_cast<int>(hs.ssid.size()),
+                      4096, EVP_sha1(), 32, pmk);
+    derive_ptk(pmk, hs.ap_mac, hs.client_mac, hs.anonce, hs.snonce, ptk);
+    return verify_mic(ptk, hs.mic, hs.eapol_frame);
+#else
+    (void)password; (void)hs;
+    return false;
+#endif
+}
+
 
 bool builtin_cracker_available() {
 #ifdef HAVE_OPENSSL

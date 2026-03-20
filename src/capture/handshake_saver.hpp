@@ -25,13 +25,15 @@ struct CrackJob {
     enum class Status { Queued, Running, Found, NotFound };
     Status status{Status::Queued};
 
-    std::string password;         // filled on Found
-    std::string actual_engine;    // "CPU", "GPU", "air" — actual engine launched
-    int handshake_count{0};       // how many complete HS captured
-    int spin_frame{0};            // spinner animation (0-3, only when Running)
+    std::string password;              // filled on Found
+    std::string actual_engine;         // "CPU", "GPU", "air" — actual engine launched
+    std::string verify_wordlist_path;  // non-empty = verification run (single-password wordlist)
+    int handshake_count{0};            // how many complete HS captured
+    int spin_frame{0};                 // spinner animation (0-3, only when Running)
 
     mutable uint64_t last_speed_check_s{0};
     mutable uint64_t cached_speed_kps{0};
+    uint64_t started_at_s{0};  // time_t when job started (for empty-log timeout)
 };
 
 class HandshakeSaver {

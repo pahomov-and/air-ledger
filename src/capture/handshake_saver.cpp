@@ -97,6 +97,25 @@ static uint64_t scan_log_for_speed(const std::string& path) {
     return speed;
 }
 
+// Create a single-entry wordlist file for password verification.
+// Returns the file path, or "" on failure.
+static std::string make_verify_wordlist(const std::string& dir, const std::string& password) {
+    std::string path = dir + "/verify.wl";
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return "";
+    std::fprintf(f, "%s\n", password.c_str());
+    std::fclose(f);
+    return path;
+}
+
+// Delete the verify wordlist temp file and clear the path.
+static void clear_verify_wordlist(CrackJob& j) {
+    if (!j.verify_wordlist_path.empty()) {
+        ::unlink(j.verify_wordlist_path.c_str());
+        j.verify_wordlist_path.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HandshakeSaver public API
 // ---------------------------------------------------------------------------
@@ -233,17 +252,38 @@ void HandshakeSaver::feed(const RawFrame& raw, const ParsedFrame& parsed) {
                     std::fprintf(stderr, "[hs] %s  same SNonce (prev=%s) — skip\n",
                                  bssid.c_str(), prev);
                 } else {
-                    // Different SNonce = new exchange (e.g. password changed).
+                    // Different SNonce = new exchange (new reconnection).
                     job->handshake = completed_hs;
-                    if (job->status == CrackJob::Status::NotFound ||
-                        job->status == CrackJob::Status::Found) {
-                        std::fprintf(stderr, "[hs] %s  new SNonce, re-queuing (prev=%s)\n",
-                            bssid.c_str(),
-                            job->status == CrackJob::Status::Found ? "found" : "not_found");
+                    if (job->status == CrackJob::Status::Found) {
+                        // New handshake (different client or reconnect).
+                        // Verify known password against it: same password → skip,
+                        // different → AP was re-keyed → re-crack with full wordlist.
+                        std::string dir;
+                        auto sit = states_.find(bssid);
+                        if (sit != states_.end()) dir = sit->second.dir;
+                        std::string vwl = dir.empty() ? "" :
+                            make_verify_wordlist(dir, job->password);
+                        if (vwl.empty()) {
+                            // Can't create temp file — just skip to be safe.
+                            std::fprintf(stderr, "[hs] %s  new SNonce, cannot create verify wordlist — skip\n",
+                                bssid.c_str());
+                        } else {
+                            std::fprintf(stderr, "[hs] %s  new SNonce, verifying known password '%s'\n",
+                                bssid.c_str(), job->password.c_str());
+                            clear_verify_wordlist(*job);
+                            job->verify_wordlist_path = vwl;
+                            job->handshake = completed_hs;
+                            job->status    = CrackJob::Status::Queued;
+                            advance_queue();
+                        }
+                    } else if (job->status == CrackJob::Status::NotFound) {
+                        // Previous wordlist exhausted — retry with fresh handshake.
+                        std::fprintf(stderr, "[hs] %s  new SNonce, re-queuing (prev=not_found)\n",
+                            bssid.c_str());
                         job->status = CrackJob::Status::Queued;
                         advance_queue();
                     }
-                    // If Queued/Running: update nonces, let current job finish first.
+                    // If Queued/Running: nonces updated, let current job finish first.
                 }
             }
         }
@@ -284,11 +324,19 @@ void HandshakeSaver::advance_queue() {
         }
         j.log_path = dir + "/crack_" + ts_buf + ".log";
 
+        // Verification run uses a single-entry wordlist; otherwise full wordlist.
+        std::vector<std::string> verify_wl_vec;
+        const std::vector<std::string>& wordlists =
+            j.verify_wordlist_path.empty()
+                ? config_.wordlists
+                : (verify_wl_vec = {j.verify_wordlist_path}, verify_wl_vec);
+
         bool ok = launch_crack_job(config_.crack_engine, j.handshake,
-                                   j.pcap_path, config_.wordlists, j.log_path);
+                                   j.pcap_path, wordlists, j.log_path);
         if (ok) {
-            j.status     = CrackJob::Status::Running;
-            j.spin_frame = 0;
+            j.status       = CrackJob::Status::Running;
+            j.spin_frame   = 0;
+            j.started_at_s = static_cast<uint64_t>(time(nullptr));
             // Track actual engine: if no M1 in memory, builtin/hashcat fall back to aircrack
             bool fallback_to_air = !j.handshake.has_m1;
             if (fallback_to_air) {
@@ -325,21 +373,62 @@ std::vector<HandshakeSaver::CrackResult> HandshakeSaver::poll_results() {
 
         std::string pw = scan_log_for_key(j.log_path);
         if (!pw.empty()) {
-            j.status   = CrackJob::Status::Found;
-            j.password = pw;
-            std::fprintf(stderr, "[hs] KEY FOUND  bssid=%s  ssid=%s  pw='%s'\n",
-                         j.bssid.c_str(), j.ssid.c_str(), pw.c_str());
-            out.push_back({j.bssid, j.ssid, pw, true});
+            if (!j.verify_wordlist_path.empty()) {
+                // Verification run: known password still valid — keep Found, skip re-crack.
+                clear_verify_wordlist(j);
+                j.status = CrackJob::Status::Found;
+                std::fprintf(stderr, "[hs] VERIFY OK  bssid=%s  pw='%s' still valid — skip re-crack\n",
+                             j.bssid.c_str(), j.password.c_str());
+            } else {
+                j.status   = CrackJob::Status::Found;
+                j.password = pw;
+                std::fprintf(stderr, "[hs] KEY FOUND  bssid=%s  ssid=%s  pw='%s'\n",
+                             j.bssid.c_str(), j.ssid.c_str(), pw.c_str());
+                out.push_back({j.bssid, j.ssid, pw, true});
+            }
             need_advance = true;
             continue;
         }
 
         if (scan_log_for_not_found(j.log_path)) {
-            j.status = CrackJob::Status::NotFound;
-            std::fprintf(stderr, "[hs] KEY NOT FOUND  bssid=%s  ssid=%s\n",
-                         j.bssid.c_str(), j.ssid.c_str());
-            out.push_back({j.bssid, j.ssid, "", false});
+            if (!j.verify_wordlist_path.empty()) {
+                // Verification run: known password no longer valid — AP re-keyed, start full crack.
+                clear_verify_wordlist(j);
+                std::fprintf(stderr, "[hs] VERIFY FAIL  bssid=%s  known pw invalid — AP re-keyed, re-cracking\n",
+                             j.bssid.c_str());
+                j.password.clear();
+                j.status = CrackJob::Status::Queued;
+            } else {
+                j.status = CrackJob::Status::NotFound;
+                std::fprintf(stderr, "[hs] KEY NOT FOUND  bssid=%s  ssid=%s\n",
+                             j.bssid.c_str(), j.ssid.c_str());
+                out.push_back({j.bssid, j.ssid, "", false});
+            }
             need_advance = true;
+            continue;
+        }
+
+        // Detect silent crash: log is still empty 15 seconds after job started
+        {
+            uint64_t now = static_cast<uint64_t>(time(nullptr));
+            if (j.started_at_s > 0 && now - j.started_at_s > 15) {
+                FILE* f = std::fopen(j.log_path.c_str(), "r");
+                bool empty = true;
+                if (f) {
+                    char buf[1];
+                    empty = (std::fread(buf, 1, 1, f) == 0);
+                    std::fclose(f);
+                }
+                if (empty) {
+                    std::fprintf(stderr, "[hs] crack log empty after 15s — engine failed silently, re-queuing\n");
+                    clear_verify_wordlist(j);
+                    j.status = CrackJob::Status::Queued;
+                    j.log_path.clear();
+                    j.cached_speed_kps = 0;
+                    j.started_at_s = 0;
+                    need_advance = true;
+                }
+            }
         }
     }
 
