@@ -49,9 +49,13 @@ static void print_usage(const char* prog) {
 #else
         "                           (hashcat disabled at build time; reconfigure with -DENABLE_GPU_CRACK=ON)\n"
 #endif
+        "  --aircrack-bin <path>   Path to aircrack-ng binary\n"
+        "  --aireplay-bin <path>   Path to aireplay-ng binary\n"
+        "  --iw-bin <path>         Path to iw binary (hopper/reset iface)\n"
         "  --deauth-engine <e>    Deauth engine: builtin (default) or aireplay\n"
         "                           builtin  — pcap_inject(), no external tools\n"
         "                           aireplay — external aireplay-ng subprocess\n"
+        "  --ui-profile <p>       UI tuning profile: auto (default), beepy\n"
         "\n"
         "Controls:\n"
         "  Left click             Select node\n"
@@ -61,6 +65,7 @@ static void print_usage(const char* prog) {
         "  h                      Toggle channel hopping\n"
         "  +/-                    Dwell time ±100ms\n"
         "  Tab / Shift+Tab        Cycle selected node\n"
+        "  Ctrl+Tab / Ctrl+Shift+Tab  Circular sidebar scroll\n"
         "  a                      Set alias for selected node\n"
         "  d                      Send deauth to selected AP\n"
         "  g                      Aggressive mode (cyclic deauth+harvest)\n"
@@ -69,6 +74,7 @@ static void print_usage(const char* prog) {
         "  k                      Crack queue overlay\n"
         "  j                      Handshake list\n"
         "  w                      Anomaly log\n"
+        "  y                      Event log\n"
         "  /                      Search by MAC / SSID / vendor\n"
         "  e                      Export JSON\n"
         "  Ctrl+R                 Reset WiFi interface (if card hangs)\n"
@@ -85,6 +91,7 @@ int main(int argc, char* argv[]) {
     HandshakeConfig hs_cfg;
     hs_cfg.auto_crack = true;
     DeauthEngine deauth_engine = DeauthEngine::Builtin;
+    UiProfile ui_profile = UiProfile::Auto;
 
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -135,6 +142,24 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 #endif
+        } else if (arg == "--aircrack-bin") {
+            if (++i >= argc) { std::fprintf(stderr, "--aircrack-bin requires an argument\n"); return 1; }
+            if (::setenv("AIR_LEDGER_AIRCRACK_BIN", argv[i], 1) != 0) {
+                std::fprintf(stderr, "Failed to set AIR_LEDGER_AIRCRACK_BIN to '%s'\n", argv[i]);
+                return 1;
+            }
+        } else if (arg == "--aireplay-bin") {
+            if (++i >= argc) { std::fprintf(stderr, "--aireplay-bin requires an argument\n"); return 1; }
+            if (::setenv("AIR_LEDGER_AIREPLAY_BIN", argv[i], 1) != 0) {
+                std::fprintf(stderr, "Failed to set AIR_LEDGER_AIREPLAY_BIN to '%s'\n", argv[i]);
+                return 1;
+            }
+        } else if (arg == "--iw-bin") {
+            if (++i >= argc) { std::fprintf(stderr, "--iw-bin requires an argument\n"); return 1; }
+            if (::setenv("AIR_LEDGER_IW_BIN", argv[i], 1) != 0) {
+                std::fprintf(stderr, "Failed to set AIR_LEDGER_IW_BIN to '%s'\n", argv[i]);
+                return 1;
+            }
         } else if (arg == "--deauth-engine") {
             if (++i >= argc) { std::fprintf(stderr, "--deauth-engine requires an argument\n"); return 1; }
             std::string eng = argv[i];
@@ -144,6 +169,15 @@ int main(int argc, char* argv[]) {
                 deauth_engine = DeauthEngine::Builtin;
             } else {
                 std::fprintf(stderr, "Unknown deauth engine '%s'. Use: builtin, aireplay\n", eng.c_str());
+                return 1;
+            }
+        } else if (arg == "--ui-profile") {
+            if (++i >= argc) { std::fprintf(stderr, "--ui-profile requires an argument\n"); return 1; }
+            std::string p = argv[i];
+            if (p == "auto") ui_profile = UiProfile::Auto;
+            else if (p == "beepy") ui_profile = UiProfile::Beepy;
+            else {
+                std::fprintf(stderr, "Unknown ui profile '%s'. Use: auto, beepy\n", p.c_str());
                 return 1;
             }
         } else if (arg[0] != '-') {
@@ -194,6 +228,7 @@ int main(int argc, char* argv[]) {
 
     App app;
     app.set_deauth_engine(deauth_engine);
+    app.set_ui_profile(ui_profile);
     if (!app.init(iface, db_path)) {
         std::fprintf(stderr, "[air-ledger] Initialization failed.\n");
         return 1;

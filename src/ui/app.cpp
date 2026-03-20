@@ -65,16 +65,22 @@ static const char* aireplay_bin() {
     return (p && *p) ? p : "aireplay-ng";
 }
 
-static int autoscaled_font_size(int h) {
+static int autoscaled_font_size(int h, bool beepy_profile) {
+    if (beepy_profile) return 14;
     // Small displays (e.g. 400x240) need slightly larger text for readability.
     if (h <= 260) return 13;
     return std::clamp(8 + h / 80, 9, 32);
 }
 
-static int sidebar_width_for(int font_size, int win_w, int win_h) {
+static int sidebar_width_for(int font_size, int win_w, int win_h, bool beepy_profile) {
+    if (beepy_profile) return std::min(font_size * 20, win_w * 34 / 100);
     // Keep more graph area on tiny displays so bottom notifications have room.
     int max_ratio = (win_w <= 500 || win_h <= 300) ? (win_w * 36 / 100) : (win_w * 2 / 5);
     return std::min(font_size * 22, max_ratio);
+}
+
+static bool starts_with(const std::string& s, const char* pfx) {
+    return s.rfind(pfx, 0) == 0;
 }
 
 // Candidate font paths to try (bundled font is tried first)
@@ -141,7 +147,8 @@ void App::resize_font(int delta) {
     font_size_ = new_size;
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(window_, &win_w, &win_h);
-    sidebar_w_ = sidebar_width_for(font_size_, win_w, win_h);
+    bool beepy = (ui_profile_ == UiProfile::Beepy);
+    sidebar_w_ = sidebar_width_for(font_size_, win_w, win_h, beepy);
     if (font_) { TTF_CloseFont(font_); font_ = nullptr; }
     load_font();  // TTF_HINTING_MONO set inside load_font
     graph_view_.set_font(font_);
@@ -192,13 +199,15 @@ bool App::init(const std::string& iface, const std::string& db_path) {
     // Auto-scale font to screen size: comfortable on both Beepy (240px) and desktop
     int actual_w = win_surface->w;
     int actual_h = win_surface->h;
-    font_size_ = autoscaled_font_size(actual_h);
-    sidebar_w_ = sidebar_width_for(font_size_, actual_w, actual_h);
+    bool beepy = (ui_profile_ == UiProfile::Beepy);
+    font_size_ = autoscaled_font_size(actual_h, beepy);
+    sidebar_w_ = sidebar_width_for(font_size_, actual_w, actual_h, beepy);
 
     load_font();
 
     // Init UI components using actual window size (fullscreen → real display dims)
-    std::fprintf(stderr, "[app] display: %dx%d  font: %dpx\n", actual_w, actual_h, font_size_);
+    std::fprintf(stderr, "[app] display: %dx%d  font: %dpx  ui_profile=%s\n",
+                 actual_w, actual_h, font_size_, beepy ? "beepy" : "auto");
     int graph_w = actual_w - sidebar_w_;
     int graph_h = actual_h;
     graph_view_.init(renderer_, font_);
@@ -254,6 +263,7 @@ bool App::init(const std::string& iface, const std::string& db_path) {
         hopper_ = std::make_unique<ChannelHopper>();
         hopper_->set_iface(iface);
     }
+    update_iface_diagnostics();
 
     return true;
 }
@@ -516,6 +526,93 @@ void App::handle_click(int sx, int sy) {
     // If click is in graph viewport, select node
     // (graph_view handles hover/drag; we need to read selected after event processing)
     // This is handled via graph_view_.selected_node()
+}
+
+void App::update_iface_diagnostics() {
+    const char* iw = iw_bin();
+    std::string cmd = std::string(iw) + " dev " + iface_name_ + " info 2>/dev/null";
+    FILE* f = popen(cmd.c_str(), "r");
+    if (!f) return;
+
+    std::string type = "?";
+    int channel = 0;
+    std::string txp = "?";
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (starts_with(s, "\ttype ") || starts_with(s, "type ")) {
+            size_t p = s.find("type ");
+            if (p != std::string::npos) type = s.substr(p + 5);
+        } else if (starts_with(s, "\tchannel ") || starts_with(s, "channel ")) {
+            size_t p = s.find("channel ");
+            if (p != std::string::npos) {
+                int ch = std::atoi(s.c_str() + static_cast<int>(p + 8));
+                if (ch > 0) channel = ch;
+            }
+        } else if (starts_with(s, "\ttxpower ") || starts_with(s, "txpower ")) {
+            size_t p = s.find("txpower ");
+            if (p != std::string::npos) txp = s.substr(p + 8);
+        }
+    }
+    pclose(f);
+    iface_diag_type_ = type;
+    iface_diag_channel_ = channel;
+    iface_diag_txpower_ = txp;
+}
+
+void App::render_action_bar(int w, int h) {
+    if (!renderer_ || !font_) return;
+    int lh = TTF_FontHeight(font_);
+    int bar_h = lh + 8;
+    SDL_Rect bar{0, h - bar_h, w, bar_h};
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+    SDL_RenderFillRect(renderer_, &bar);
+    SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
+    SDL_RenderDrawLine(renderer_, 0, h - bar_h, w, h - bar_h);
+
+    bool compact = (w <= 500 || h <= 300 || ui_profile_ == UiProfile::Beepy);
+    std::string left;
+    if (graph_view_.ap_list_visible()) left = compact ? "AP: Up/Dn Tab Enter d p/Esc" : "AP LIST: Up/Dn/Tab nav  Enter select  d deauth  p/Esc close";
+    else if (graph_view_.crack_list_visible()) left = compact ? "CRK: Up/Dn Tab Enter k/Esc" : "CRACK: Up/Dn/Tab nav  Enter select AP  k/Esc close";
+    else if (graph_view_.hs_list_visible()) left = compact ? "HS: Up/Dn Tab Enter j/Esc" : "HS: Up/Dn/Tab nav  Enter select client  j/Esc close";
+    else if (graph_view_.anomaly_log_visible()) left = compact ? "WARN: Up/Dn Tab Enter w/Esc" : "ANOMALY: Up/Dn/Tab nav  Enter select src  w/Esc close";
+    else if (graph_view_.event_log_visible()) left = compact ? "LOG: Up/Dn Tab y/Esc" : "EVENT LOG: Up/Dn/Tab nav  y/Esc close";
+    else left = compact ? "Tab nodes  Shift+Up/Down side  Ctrl+Tab side  p/k/j/w/y" : "Tab select AP  Shift+Up/Down sidebar  Ctrl+Tab sidebar-cycle  p/k/j/w/y windows";
+
+    std::string right = "IF:" + iface_diag_type_
+        + " CH:" + (iface_diag_channel_ > 0 ? std::to_string(iface_diag_channel_) : "?")
+        + " TX:" + iface_diag_txpower_;
+
+    auto draw_text = [&](const std::string& txt, int x, SDL_Color col) {
+        SDL_Surface* s = TTF_RenderUTF8_Blended(font_, txt.c_str(), col);
+        if (!s) return;
+        SDL_Texture* t = SDL_CreateTextureFromSurface(renderer_, s);
+        int tw = s->w, th = s->h;
+        SDL_FreeSurface(s);
+        if (!t) return;
+        SDL_Rect dst{x, h - bar_h + 3, tw, th};
+        SDL_RenderCopy(renderer_, t, nullptr, &dst);
+        SDL_DestroyTexture(t);
+    };
+
+    int rw = 0, rh = 0;
+    TTF_SizeUTF8(font_, right.c_str(), &rw, &rh);
+    int max_left_w = std::max(20, w - rw - 16);
+    std::string ltxt = left;
+    while (!ltxt.empty()) {
+        int tw = 0, th = 0;
+        TTF_SizeUTF8(font_, ltxt.c_str(), &tw, &th);
+        if (tw <= max_left_w) break;
+        if (ltxt.size() <= 4) break;
+        ltxt.pop_back();
+    }
+    if (ltxt.size() < left.size() && ltxt.size() > 2) {
+        ltxt.back() = '~';
+    }
+    draw_text(ltxt, 4, {220, 220, 220, 255});
+    draw_text(right, std::max(4, w - rw - 6), {255, 220, 60, 255});
 }
 
 void App::push_error(const std::string& msg) {
@@ -1181,7 +1278,8 @@ void App::run() {
                     // First valid resize: recalculate font size (window was 1×1 at init)
                     if (!initial_resize_done_ && cur_w > 1 && cur_h > 1) {
                         initial_resize_done_ = true;
-                        font_size_ = autoscaled_font_size(cur_h);
+                        bool beepy = (ui_profile_ == UiProfile::Beepy);
+                        font_size_ = autoscaled_font_size(cur_h, beepy);
                         if (font_) { TTF_CloseFont(font_); font_ = nullptr; }
                         load_font();
                         graph_view_.set_font(font_);
@@ -1189,7 +1287,8 @@ void App::run() {
                         std::fprintf(stderr, "[app] initial resize: %dx%d  font: %dpx\n",
                                      cur_w, cur_h, font_size_);
                     }
-                    sidebar_w_ = sidebar_width_for(font_size_, cur_w, cur_h);
+                    bool beepy = (ui_profile_ == UiProfile::Beepy);
+                    sidebar_w_ = sidebar_width_for(font_size_, cur_w, cur_h, beepy);
                     int gw = cur_w - sidebar_w_;
                     graph_view_.set_viewport(0, 0, gw, cur_h);
                     layout_.set_bounds(static_cast<float>(gw), static_cast<float>(cur_h));
@@ -1435,6 +1534,10 @@ void App::run() {
 
         // Periodic analytics
         uint64_t now = now_us();
+        if (now - last_iface_diag_us_ > 1'000'000ULL) {
+            update_iface_diagnostics();
+            last_iface_diag_us_ = now;
+        }
         if (now - last_analytics_us_ > ANALYTICS_INTERVAL_US) {
             run_analytics();
             last_analytics_us_ = now;
@@ -1605,6 +1708,9 @@ void App::run() {
                         hopper_ ? hopper_->channel_count()   : 0,
                         hopper_ ? hopper_->is_locked()        : false,
                         hopper_ ? hopper_->locked_channel()   : 0);
+
+        // Sticky action bar with active hotkeys + live iface diagnostics
+        render_action_bar(cur_w, cur_h);
 
         // Startup diagnostic overlay — drawn on top of everything
         if (startup_dialog_open_)

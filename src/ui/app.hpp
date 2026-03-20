@@ -24,6 +24,7 @@
 #include <string>
 
 enum class DeauthEngine { Builtin, Aireplay };
+enum class UiProfile { Auto, Beepy };
 
 class App {
 public:
@@ -33,6 +34,7 @@ public:
     bool init(const std::string& iface, const std::string& db_path);
     void init_handshake(const HandshakeConfig& cfg);
     void set_deauth_engine(DeauthEngine e) { deauth_engine_ = e; }
+    void set_ui_profile(UiProfile p) { ui_profile_ = p; }
     void run();
     void stop();
 
@@ -66,6 +68,8 @@ private:
     std::vector<AppNotif> notifications_;
     void push_error(const std::string& msg);
     void push_warning(const std::string& msg);
+    void push_notice(const std::string& msg, uint64_t ttl_us = 4'000'000ULL);
+    void add_event_log(const std::string& msg, SDL_Color color);
 
     // Capture
     std::unique_ptr<PcapSource> capture_;
@@ -120,9 +124,16 @@ private:
     bool prev_dragging_{false};   // for drag-release velocity reset
     NodeId prev_selected_{0};    // for channel-lock on selection change
     size_t last_saved_node_count_{0};
+    UiProfile ui_profile_{UiProfile::Auto};
+    uint64_t last_iface_diag_us_{0};
+    int      iface_diag_channel_{0};
+    std::string iface_diag_type_{"?"};
+    std::string iface_diag_txpower_{"?"};
 
     void process_pending_frames();
     void run_analytics();
+    void update_iface_diagnostics();
+    void render_action_bar(int w, int h);
     void apply_selection_channel_lock(NodeId selected); // switch to AP's channel
     static uint64_t now_us();
 
@@ -141,6 +152,8 @@ private:
     AnomalyDetector anomaly_detector_;
     std::vector<AnomalyEvent> anomaly_log_;  // last 100 events (newest first)
     static constexpr size_t ANOMALY_LOG_MAX = 100;
+    std::vector<GraphView::EventLogEntry> event_log_; // newest first
+    static constexpr size_t EVENT_LOG_MAX = 300;
 
     // Aggressive mode — cyclic deauth → handshake harvest
     bool     aggressive_mode_{false};
