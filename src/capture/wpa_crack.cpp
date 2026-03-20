@@ -4,6 +4,7 @@
 #include <ctime>
 #include <chrono>
 #include <fstream>
+#include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -32,6 +33,50 @@ static bool check_file_readable(const char* path, const char* label) {
         return false;
     }
     return true;
+}
+
+// Resolve executable path using PATH env. Returns true if at least one
+// executable candidate is found.
+static bool find_executable_in_path(const char* name, std::string* out = nullptr) {
+    if (!name || !*name) return false;
+
+    // Absolute/relative path with slash.
+    if (std::strchr(name, '/')) {
+        if (::access(name, X_OK) == 0) {
+            if (out) *out = name;
+            return true;
+        }
+        return false;
+    }
+
+    const char* path_env = std::getenv("PATH");
+    if (!path_env || !*path_env) return false;
+
+    std::string path(path_env);
+    size_t pos = 0;
+    while (true) {
+        size_t next = path.find(':', pos);
+        std::string dir = path.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        if (dir.empty()) dir = ".";
+        std::string cand = dir + "/" + name;
+        if (::access(cand.c_str(), X_OK) == 0) {
+            if (out) *out = cand;
+            return true;
+        }
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    return false;
+}
+
+static bool resolve_hashcat_binary(std::string& out) {
+    const char* env_bin = std::getenv("AIR_LEDGER_HASHCAT_BIN");
+    if (env_bin && *env_bin) {
+        if (find_executable_in_path(env_bin, &out)) return true;
+        std::fprintf(stderr, "[hashcat] AIR_LEDGER_HASHCAT_BIN is not executable: %s\n", env_bin);
+        return false;
+    }
+    return find_executable_in_path("hashcat", &out);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,19 +456,14 @@ static void run_hashcat_child(const WpaHandshake& hs,
     std::fprintf(stderr, "[hashcat] starting  AP: %s (%s)  wordlists: %zu\n",
                  ssid_str, bssid_str, wordlists.size());
 
-    // Find hashcat binary
-    const char* hashcat_bin = nullptr;
-    for (auto p : {"/usr/bin/hashcat", "/usr/local/bin/hashcat"}) {
-        if (::access(p, X_OK) == 0) { hashcat_bin = p; break; }
-    }
-    if (!hashcat_bin) {
-        // Try PATH via execvp later; we still need the path for the check here.
-        // Use "hashcat" and let execvp resolve it.
-        hashcat_bin = "hashcat";
-    }
+    // Find hashcat binary.
+    std::string hashcat_bin = "hashcat";
+    if (!resolve_hashcat_binary(hashcat_bin))
+        std::fprintf(stderr, "[hashcat] warning: hashcat not pre-resolved in PATH, trying execvp\n");
 
     bool found = false;
     std::string password;
+    bool backend_error = false;
 
     for (const auto& wl : wordlists) {
         if (!check_file_readable(wl.c_str(), "wordlist")) continue;
@@ -460,9 +500,9 @@ static void run_hashcat_child(const WpaHandshake& hs,
             // ── grandchild: hashcat ──
             close(pipefd[0]);
             dup2(pipefd[1], STDOUT_FILENO);
-            // stderr → /dev/null to suppress GPU init noise
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+            // Forward stderr too: on embedded targets this often contains
+            // backend/OpenCL diagnostics needed for troubleshooting.
+            dup2(pipefd[1], STDERR_FILENO);
             close(pipefd[1]);
             for (int i = 3; i < 256; ++i) close(i);
             execvp(argv[0], const_cast<char* const*>(argv.data()));
@@ -506,6 +546,19 @@ static void run_hashcat_child(const WpaHandshake& hs,
             if (std::strstr(line, "EXEC_FAILED")) {
                 std::fprintf(stderr, "[hashcat] ERROR: hashcat not found in PATH\n");
             }
+            if (std::strstr(line, "HIPRTC_ERROR")
+                    || (std::strstr(line, "Kernel") && std::strstr(line, "build failed"))
+                    || std::strstr(line, "No devices found/left")
+                    || std::strstr(line, "clBuildProgram")
+                    || std::strstr(line, "Aborting session due to kernel build")
+                    || std::strstr(line, "No OpenCL-compatible, HIP-compatible or CUDA-compatible")
+                    || std::strstr(line, "ATTENTION! No OpenCL or CUDA installation found.")) {
+                backend_error = true;
+            }
+            if (log) {
+                std::fputs(line, log);
+                std::fflush(log);
+            }
         }
         if (pipe_in) std::fclose(pipe_in);
 
@@ -533,7 +586,9 @@ static void run_hashcat_child(const WpaHandshake& hs,
             // Exhausted this wordlist, continue to next
         } else {
             std::fprintf(stderr, "[hashcat] non-zero exit %d — skipping wordlist\n", exit_code);
+            backend_error = true;
         }
+        if (backend_error) break;
     }
 
     // Write final result in aircrack-ng format (parsed by handshake_saver.cpp)
@@ -542,6 +597,7 @@ static void run_hashcat_child(const WpaHandshake& hs,
                      bssid_str, password.c_str());
         if (log) std::fprintf(log, "KEY FOUND! [ %s ]\n", password.c_str());
     } else {
+        if (backend_error && log) std::fprintf(log, "HASHCAT BACKEND ERROR\n");
         std::fprintf(stderr, "[hashcat] KEY NOT FOUND  AP: %s\n", bssid_str);
         if (log) std::fprintf(log, "KEY NOT FOUND.\n");
     }
@@ -559,13 +615,13 @@ static bool run_hashcat(const WpaHandshake& hs,
         return false;
     }
 
-    // Derive side-car paths from log_path (share the same directory)
-    std::string dir = log_path;
-    auto slash = dir.rfind('/');
-    if (slash != std::string::npos) dir.resize(slash + 1); else dir = "./";
+    // Use per-job side-car files (derived from unique crack log path)
+    // to avoid stale cross-run results when password changes.
+    std::string hash_path   = log_path + ".hc22000";
+    std::string result_path = log_path + ".result";
 
-    std::string hash_path   = dir + "hashcat.hc22000";
-    std::string result_path = dir + "hashcat_result.txt";
+    // Ensure stale output from previous runs never leaks into current result.
+    ::unlink(result_path.c_str());
 
     if (!write_hc22000(hs, hash_path)) return false;
 
@@ -611,11 +667,8 @@ bool builtin_cracker_available() {
 
 bool hashcat_cracker_available() {
 #ifdef HAVE_GPU_CRACK
-    for (auto p : {"/usr/bin/hashcat", "/usr/local/bin/hashcat"}) {
-        if (::access(p, X_OK) == 0) return true;
-    }
-    // Also check PATH via access on bare name (non-standard but common)
-    return false;
+    std::string dummy;
+    return resolve_hashcat_binary(dummy);
 #else
     return false;
 #endif

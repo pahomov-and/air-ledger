@@ -76,6 +76,29 @@ static bool scan_log_for_not_found(const std::string& path) {
     return found;
 }
 
+// Detect hashcat backend/runtime failures that should trigger CPU fallback.
+static bool scan_log_for_hashcat_error(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+    char line[1024];
+    bool found = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strstr(line, "HIPRTC_ERROR")
+                || (std::strstr(line, "Kernel") && std::strstr(line, "build failed"))
+                || std::strstr(line, "No devices found/left")
+                || std::strstr(line, "clBuildProgram")
+                || std::strstr(line, "Aborting session due to kernel build")
+                || std::strstr(line, "No OpenCL-compatible, HIP-compatible or CUDA-compatible")
+                || std::strstr(line, "ATTENTION! No OpenCL or CUDA installation found.")
+                || std::strstr(line, "HASHCAT BACKEND ERROR")) {
+            found = true;
+            break;
+        }
+    }
+    std::fclose(f);
+    return found;
+}
+
 // Scan log for most recent speed line: "[00:00:15] 12345 keys tested (1234.5 k/s)"
 static uint64_t scan_log_for_speed(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "r");
@@ -331,7 +354,8 @@ void HandshakeSaver::advance_queue() {
                 ? config_.wordlists
                 : (verify_wl_vec = {j.verify_wordlist_path}, verify_wl_vec);
 
-        bool ok = launch_crack_job(config_.crack_engine, j.handshake,
+        CrackEngine engine = j.force_builtin ? CrackEngine::Builtin : config_.crack_engine;
+        bool ok = launch_crack_job(engine, j.handshake,
                                    j.pcap_path, wordlists, j.log_path);
         if (ok) {
             j.status       = CrackJob::Status::Running;
@@ -342,7 +366,7 @@ void HandshakeSaver::advance_queue() {
             if (fallback_to_air) {
                 j.actual_engine = "air";
             } else {
-                switch (config_.crack_engine) {
+                switch (engine) {
 #ifdef HAVE_GPU_CRACK
                     case CrackEngine::Hashcat:  j.actual_engine = "GPU"; break;
 #endif
@@ -391,6 +415,21 @@ std::vector<HandshakeSaver::CrackResult> HandshakeSaver::poll_results() {
         }
 
         if (scan_log_for_not_found(j.log_path)) {
+            if (j.actual_engine == "GPU" && scan_log_for_hashcat_error(j.log_path)) {
+                // Hashcat backend failed (driver/runtime/compiler). Re-queue this
+                // job and force builtin CPU engine to avoid false "not found".
+                std::fprintf(stderr,
+                             "[hs] hashcat backend error for bssid=%s — switching job to builtin CPU\n",
+                             j.bssid.c_str());
+                clear_verify_wordlist(j);
+                j.force_builtin = true;
+                j.status = CrackJob::Status::Queued;
+                j.log_path.clear();
+                j.cached_speed_kps = 0;
+                j.started_at_s = 0;
+                need_advance = true;
+                continue;
+            }
             if (!j.verify_wordlist_path.empty()) {
                 // Verification run: known password no longer valid — AP re-keyed, start full crack.
                 clear_verify_wordlist(j);

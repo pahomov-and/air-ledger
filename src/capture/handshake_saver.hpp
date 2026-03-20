@@ -27,6 +27,7 @@ struct CrackJob {
 
     std::string password;              // filled on Found
     std::string actual_engine;         // "CPU", "GPU", "air" — actual engine launched
+    bool force_builtin{false};         // true = this job must run builtin engine (GPU backend failed)
     std::string verify_wordlist_path;  // non-empty = verification run (single-password wordlist)
     int handshake_count{0};            // how many complete HS captured
     int spin_frame{0};                 // spinner animation (0-3, only when Running)

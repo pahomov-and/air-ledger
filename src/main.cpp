@@ -4,6 +4,7 @@
 #include "capture/deauth_sender.hpp"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -43,8 +44,10 @@ static void print_usage(const char* prog) {
         "                                      Uses AMD/NVIDIA/Intel GPU when available,\n"
         "                                      falls back to CPU automatically.\n"
         "                                      Requires hashcat in PATH.\n"
+        "  --hashcat-bin <path>    Path to hashcat binary (overrides PATH lookup)\n"
+        "                         Example: --hashcat-bin /tmp/hashcat-7.1.2/hashcat.bin\n"
 #else
-        "                           (hashcat disabled — ARM/RPi build)\n"
+        "                           (hashcat disabled at build time; reconfigure with -DENABLE_GPU_CRACK=ON)\n"
 #endif
         "  --deauth-engine <e>    Deauth engine: builtin (default) or aireplay\n"
         "                           builtin  — pcap_inject(), no external tools\n"
@@ -124,6 +127,14 @@ int main(int argc, char* argv[]) {
                     "\n", eng.c_str());
                 return 1;
             }
+#ifdef HAVE_GPU_CRACK
+        } else if (arg == "--hashcat-bin") {
+            if (++i >= argc) { std::fprintf(stderr, "--hashcat-bin requires an argument\n"); return 1; }
+            if (::setenv("AIR_LEDGER_HASHCAT_BIN", argv[i], 1) != 0) {
+                std::fprintf(stderr, "Failed to set AIR_LEDGER_HASHCAT_BIN to '%s'\n", argv[i]);
+                return 1;
+            }
+#endif
         } else if (arg == "--deauth-engine") {
             if (++i >= argc) { std::fprintf(stderr, "--deauth-engine requires an argument\n"); return 1; }
             std::string eng = argv[i];

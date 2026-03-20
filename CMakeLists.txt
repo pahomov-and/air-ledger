@@ -14,25 +14,16 @@ pkg_check_modules(SDL2_TTF REQUIRED SDL2_ttf)
 pkg_check_modules(SDL2_GFX SDL2_gfx)
 
 # ── GPU cracking via hashcat ─────────────────────────────────────────────────
-# Enabled by default on x86/x86_64; disabled automatically when cross-compiling
-# for ARM (RPi). Override with -DENABLE_GPU_CRACK=ON/OFF.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64|armv[0-9])")
-    set(_GPU_CRACK_DEFAULT OFF)
-else()
-    set(_GPU_CRACK_DEFAULT ON)
-endif()
-# Also honour cross-toolchain ARM target files
-if(CMAKE_CROSSCOMPILING AND (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64"
-        OR (DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "arm")))
-    set(_GPU_CRACK_DEFAULT OFF)
-endif()
-option(ENABLE_GPU_CRACK "GPU cracking via hashcat (auto-disabled on ARM)" ${_GPU_CRACK_DEFAULT})
+# Enabled by default on common desktop/embedded targets (x86_64, aarch64).
+# Override with -DENABLE_GPU_CRACK=ON/OFF.
+set(_GPU_CRACK_DEFAULT ON)
+option(ENABLE_GPU_CRACK "GPU cracking via hashcat" ${_GPU_CRACK_DEFAULT})
 
 if(ENABLE_GPU_CRACK)
     message(STATUS "GPU cracking: ENABLED  (hashcat subprocess, -m 22000)")
     # hashcat is found/used at runtime; no compile-time library needed.
 else()
-    message(STATUS "GPU cracking: DISABLED  (ARM/RPi build)")
+    message(STATUS "GPU cracking: DISABLED")
 endif()
 
 # SQLite3
