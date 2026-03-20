@@ -84,8 +84,8 @@ private:
     uint64_t last_active_mark_us_{0};
 
     // Window layout constants
-    static constexpr int WIN_W    = 1400;
-    static constexpr int WIN_H    = 900;
+    static constexpr int WIN_W    = 1280;
+    static constexpr int WIN_H    = 720;
     int sidebar_w_{320};  // recalculated from font_size_ on resize
 
     // Channel hopping
@@ -160,11 +160,13 @@ private:
     int      aggr_ap_idx_{0};          // index into sorted AP list
     uint64_t aggr_next_us_{0};         // when to fire next action
     std::string aggr_target_label_;    // label of current target (for UI)
+    uint64_t aggr_arm_until_us_{0};    // double-press window for enabling aggressive mode
 
     static constexpr uint64_t AGGR_DWELL_US = 8'000'000ULL; // 8s per AP
 
     void toggle_aggressive_mode();
     void tick_aggressive_mode();
+    void run_inject_diagnostics(NodeId ap_id);
 
     void toggle_channel_hopping();
     void reset_iface();
@@ -179,4 +181,5 @@ private:
     void start_search();
     void cancel_search();
     void refresh_hs_list();  // rebuild handshake list for overlay
+    void toggle_auto_crack();
 };

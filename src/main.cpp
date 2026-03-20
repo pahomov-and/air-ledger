@@ -61,6 +61,7 @@ static void print_usage(const char* prog) {
         "  Left click             Select node\n"
         "  Scroll / z / x         Zoom in/out\n"
         "  Arrow keys             Pan view\n"
+        "  F11                    Toggle fullscreen (desktop profile)\n"
         "  Middle drag            Pan view with mouse\n"
         "  h                      Toggle channel hopping\n"
         "  +/-                    Dwell time ±100ms\n"
@@ -68,6 +69,7 @@ static void print_usage(const char* prog) {
         "  Ctrl+Tab / Ctrl+Shift+Tab  Circular sidebar scroll\n"
         "  a                      Set alias for selected node\n"
         "  d                      Send deauth to selected AP\n"
+        "  t                      Toggle auto-crack for new handshakes\n"
         "  g                      Aggressive mode (cyclic deauth+harvest)\n"
         "  f / r                  Filter active / random-MAC nodes\n"
         "  p                      AP list overlay\n"
@@ -198,6 +200,12 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Error: no interface specified.\n\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (ui_profile == UiProfile::Beepy) {
+        ::setenv("AIR_LEDGER_UI_PROFILE", "beepy", 1);
+    } else {
+        ::setenv("AIR_LEDGER_UI_PROFILE", "auto", 1);
     }
 
     // Default passwords file: <capture-dir>/passwords.txt

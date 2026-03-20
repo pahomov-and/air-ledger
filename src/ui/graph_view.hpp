@@ -76,6 +76,7 @@ public:
     struct EventLogEntry {
         std::string text;
         SDL_Color   color{200, 200, 200, 255};
+        uint32_t    repeats{1};
     };
     void toggle_event_log() { show_event_log_ = !show_event_log_; event_log_cursor_ = 0; }
     void close_event_log()  { show_event_log_ = false; }

@@ -41,6 +41,8 @@ class HandshakeSaver {
 public:
     void configure(const HandshakeConfig& cfg);
     bool is_active() const { return !config_.capture_dir.empty(); }
+    void set_auto_crack(bool enabled) { config_.auto_crack = enabled; }
+    bool auto_crack_enabled() const { return config_.auto_crack; }
 
     void update_ssid(const std::string& bssid, const std::string& ssid);
     void feed(const RawFrame& raw, const ParsedFrame& parsed);

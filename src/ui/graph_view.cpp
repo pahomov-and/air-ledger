@@ -6,6 +6,16 @@
 #include <cctype>
 #include <chrono>
 #include <sstream>
+#include <cstdlib>
+
+static bool beepy_ui_profile() {
+    const char* p = std::getenv("AIR_LEDGER_UI_PROFILE");
+    return p && std::string(p) == "beepy";
+}
+
+static Uint8 overlay_alpha() {
+    return beepy_ui_profile() ? 255 : 220;
+}
 
 // Regular (non-ghost) SSID nodes are hidden — the AP label carries the SSID name.
 // Clients belonging to collapsed AP groups are also hidden.
@@ -61,8 +71,9 @@ SDL_Color GraphView::node_color(const Node& n, bool active_boost, uint8_t alpha_
     // 8-color Memory LCD palette: {0,0,0} {255,255,255} {255,0,0} {0,255,0}
     //   {0,0,255} {0,255,255} {255,0,255} {255,255,0}
     // Inactive nodes rendered at half-alpha so they remain distinguishable but dimmer.
-    uint8_t a = (active_boost && !n.is_active) ? static_cast<uint8_t>(alpha_override / 3)
-                                                : alpha_override;
+    uint8_t a = (active_boost && !n.is_active && !beepy_ui_profile())
+        ? static_cast<uint8_t>(alpha_override / 3)
+        : alpha_override;
     switch (n.type) {
         case NodeType::Client:  return {  0,   0, 255, a};  // blue
         case NodeType::AP:      return {255,   0,   0, a};  // red
@@ -645,7 +656,7 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
         if (show_help_) {
             // Semi-transparent dark background covering the graph area
             SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-            SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+            SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
             SDL_RenderFillRect(renderer_, &clip);
 
             // Single-column help, scrollable with Space
@@ -674,7 +685,9 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                 " [space]    next page",
                 "-",
                 " d          deauth selected AP",
-                " g          aggressive mode",
+                " Ctrl+d     inject diagnostic (selected AP)",
+                " t          auto-crack on/off",
+                " g          aggressive mode (double press)",
                 "            (cyclic deauth harvest)",
                 " Ctrl+R     reset WiFi interface",
                 "-",
@@ -816,7 +829,7 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                     auto lines = wrap_lines(notifications_[i].text);
                     ny -= static_cast<int>(lines.size()) * (lh + 2);
                     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-                    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+                    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
                     SDL_Rect bg{vp_x_ + 2, ny - 1, vp_w_ - 6, static_cast<int>(lines.size()) * (lh + 2) + 2};
                     SDL_RenderFillRect(renderer_, &bg);
                     int ly = ny;
@@ -1041,7 +1054,7 @@ void GraphView::draw_ap_list(const Graph& graph) {
 
     SDL_Rect clip{vp_x_, vp_y_, vp_w_, vp_h_};
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
     SDL_RenderFillRect(renderer_, &clip);
 
     int lh   = TTF_FontHeight(font_);
@@ -1167,7 +1180,7 @@ void GraphView::draw_crack_list() {
 
     SDL_Rect clip{vp_x_, vp_y_, vp_w_, vp_h_};
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
     SDL_RenderFillRect(renderer_, &clip);
 
     int lh  = TTF_FontHeight(font_);
@@ -1308,7 +1321,7 @@ void GraphView::draw_hs_list() {
 
     SDL_Rect clip{vp_x_, vp_y_, vp_w_, vp_h_};
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
     SDL_RenderFillRect(renderer_, &clip);
 
     int lh  = TTF_FontHeight(font_);
@@ -1450,7 +1463,7 @@ void GraphView::draw_anomaly_log() {
     // Semi-transparent dark background
     SDL_Rect clip{vp_x_, vp_y_, vp_w_, vp_h_};
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
     SDL_RenderFillRect(renderer_, &clip);
 
     int lh  = TTF_FontHeight(font_);
@@ -1558,7 +1571,7 @@ void GraphView::draw_event_log() {
 
     SDL_Rect clip{vp_x_, vp_y_, vp_w_, vp_h_};
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 220);
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
     SDL_RenderFillRect(renderer_, &clip);
 
     int lh  = TTF_FontHeight(font_);
@@ -1609,6 +1622,7 @@ void GraphView::draw_event_log() {
                 SDL_RenderFillRect(renderer_, &hl);
             }
             std::string line = e.text;
+            if (e.repeats > 1) line += "  x" + std::to_string(e.repeats);
             if (static_cast<int>(line.size()) > max_chars)
                 line = line.substr(0, static_cast<size_t>(max_chars - 1)) + "~";
             SDL_Color col = is_cur ? SDL_Color{255, 255, 0, 255} : e.color;
