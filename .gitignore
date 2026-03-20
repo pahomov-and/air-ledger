@@ -1,0 +1,9 @@
+build/
+*.db
+*.pcap
+test_*/
+oe-logs/
+oe-workdir/
+*.o
+*.a
+*.so
