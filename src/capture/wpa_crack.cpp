@@ -79,6 +79,16 @@ static bool resolve_hashcat_binary(std::string& out) {
     return find_executable_in_path("hashcat", &out);
 }
 
+static bool resolve_aircrack_binary(std::string& out) {
+    const char* env_bin = std::getenv("AIR_LEDGER_AIRCRACK_BIN");
+    if (env_bin && *env_bin) {
+        if (find_executable_in_path(env_bin, &out)) return true;
+        std::fprintf(stderr, "[crack] AIR_LEDGER_AIRCRACK_BIN is not executable: %s\n", env_bin);
+        return false;
+    }
+    return find_executable_in_path("aircrack-ng", &out);
+}
+
 // ---------------------------------------------------------------------------
 // EAPOL field extraction
 // ---------------------------------------------------------------------------
@@ -207,10 +217,9 @@ static bool run_aircrack(const WpaHandshake& hs,
         return false;
     }
 
-    // Find aircrack-ng in PATH
-    if (::access("/usr/bin/aircrack-ng", X_OK) != 0 &&
-        ::access("/usr/local/bin/aircrack-ng", X_OK) != 0) {
-        std::fprintf(stderr, "[crack] ERROR: aircrack-ng not found in /usr/bin or /usr/local/bin\n");
+    std::string aircrack_bin = "aircrack-ng";
+    if (!resolve_aircrack_binary(aircrack_bin)) {
+        std::fprintf(stderr, "[crack] ERROR: aircrack-ng not found (set --aircrack-bin to override)\n");
         return false;
     }
 
@@ -229,8 +238,8 @@ static bool run_aircrack(const WpaHandshake& hs,
         int fd = open(log_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
         for (int i = 3; i < 256; ++i) close(i);
-        const char* av[] = { "aircrack-ng", "-w", wlists.c_str(), "-b", bssid, pcap_path.c_str(), nullptr };
-        execvp("aircrack-ng", const_cast<char* const*>(av));
+        const char* av[] = { aircrack_bin.c_str(), "-w", wlists.c_str(), "-b", bssid, pcap_path.c_str(), nullptr };
+        execvp(aircrack_bin.c_str(), const_cast<char* const*>(av));
         dprintf(STDOUT_FILENO, "ERROR: exec aircrack-ng failed: %s\n", strerror(errno));
         _exit(1);
     }
