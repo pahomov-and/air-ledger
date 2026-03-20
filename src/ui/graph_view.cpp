@@ -1175,6 +1175,8 @@ void GraphView::draw_crack_list() {
                     break;
                 case S::Running:
                     status_str = std::string("RUN ") + SPIN[e.spin_frame & 3];
+                    if (e.speed_kps > 0)
+                        status_str += " " + std::to_string(e.speed_kps) + "k/s";
                     status_col = {255, 255, 0, 255};
                     break;
                 case S::Found:

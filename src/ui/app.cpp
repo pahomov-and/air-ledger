@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <algorithm>
+#include <sstream>
 #include <unordered_set>
 #include <thread>
 #include <sys/stat.h>
@@ -183,7 +184,8 @@ bool App::init(const std::string& iface, const std::string& db_path) {
 
 void App::init_handshake(const HandshakeConfig& cfg) {
     handshake_saver_.configure(cfg);
-    passwords_file_ = cfg.passwords_file;
+    passwords_file_   = cfg.passwords_file;
+    startup_wordlists_ = cfg.wordlists; // save for startup diagnostic
     // Create parent directory for passwords file if needed
     if (!passwords_file_.empty()) {
         auto slash = passwords_file_.rfind('/');
@@ -427,7 +429,7 @@ void App::run_analytics() {
             db_.update_handshake_crack(r.bssid, "not_found", "");
             for (auto& [id, n] : graph_.nodes()) {
                 if (n.type == NodeType::AP && n.label == r.bssid) {
-                    if (n.passwords.empty()) n.crack_not_found = true;
+                    n.crack_not_found = true;
                     break;
                 }
             }
@@ -872,12 +874,185 @@ void App::export_json(NodeId focus) {
     std::fprintf(stderr, "[export] Saved %s (%zu nodes)\n", fname, export_nodes.size());
 }
 
+// ---------------------------------------------------------------------------
+// Startup diagnostic checks
+// ---------------------------------------------------------------------------
+
+void App::check_startup() {
+    startup_warnings_.clear();
+
+    // pcap file playback — skip live-interface checks
+    auto ends_with = [](const std::string& s, const std::string& suffix) {
+        return s.size() >= suffix.size() &&
+               s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    bool is_pcap_file = ends_with(iface_name_, ".pcap") ||
+                        ends_with(iface_name_, ".pcapng");
+
+    if (!is_pcap_file && !iface_name_.empty()) {
+        char path[128];
+
+        // 1. Monitor mode — ARPHRD type: 803=radiotap monitor, 801=monitor (both OK)
+        std::snprintf(path, sizeof(path),
+                      "/sys/class/net/%s/type", iface_name_.c_str());
+        FILE* f = std::fopen(path, "r");
+        if (!f) {
+            startup_warnings_.push_back("Interface not found: " + iface_name_);
+        } else {
+            int arphrd = 0;
+            std::fscanf(f, "%d", &arphrd);
+            std::fclose(f);
+            if (arphrd != 803 && arphrd != 801) {
+                startup_warnings_.push_back(
+                    "Interface '" + iface_name_ + "' is NOT in monitor mode"
+                    " (type=" + std::to_string(arphrd) + "). "
+                    "Run: iw dev " + iface_name_ + " set type monitor");
+            }
+        }
+
+        // 2. Operstate — should be 'up' or 'unknown' (some drivers report 'unknown' in monitor)
+        std::snprintf(path, sizeof(path),
+                      "/sys/class/net/%s/operstate", iface_name_.c_str());
+        f = std::fopen(path, "r");
+        if (f) {
+            char state[32] = {};
+            std::fgets(state, sizeof(state), f);
+            std::fclose(f);
+            size_t n = std::strlen(state);
+            while (n > 0 && (state[n-1] == '\n' || state[n-1] == '\r')) state[--n] = '\0';
+            if (std::strcmp(state, "up") != 0 && std::strcmp(state, "unknown") != 0) {
+                startup_warnings_.push_back(
+                    "Interface '" + iface_name_ + "' is down (operstate=" +
+                    std::string(state) + "). "
+                    "Run: ip link set " + iface_name_ + " up");
+            }
+        }
+
+        // 3. Privileges — pcap needs root or CAP_NET_RAW
+        if (::getuid() != 0) {
+            startup_warnings_.push_back(
+                "Not running as root. Packet capture requires root or CAP_NET_RAW.");
+        }
+    }
+
+    // 4. Capture thread not started — open() failed
+    if (!capture_thread_.joinable()) {
+        startup_warnings_.push_back(
+            "Capture failed to open on '" + iface_name_ +
+            "'. Check interface name and permissions.");
+    }
+
+    // 5. Wordlists missing (if handshake capture configured)
+    for (const auto& wl : startup_wordlists_) {
+        if (::access(wl.c_str(), R_OK) != 0) {
+            startup_warnings_.push_back("Wordlist not found: " + wl);
+        }
+    }
+    if (handshake_saver_.is_active() && startup_wordlists_.empty()) {
+        startup_warnings_.push_back(
+            "Handshake capture enabled but no --wordlist specified. "
+            "Handshakes will be saved but not cracked.");
+    }
+
+    startup_dialog_open_ = !startup_warnings_.empty();
+}
+
+void App::render_startup_dialog(int w, int h) {
+    if (!renderer_ || !font_) return;
+
+    int lh  = TTF_FontHeight(font_) + 2;
+    int pad = std::max(4, w / 50); // ~8px on 400px screen, ~20px on 1000px
+    int max_text_w = w - pad * 2 - 4;
+
+    // Full-screen background
+    SDL_SetRenderDrawColor(renderer_, 10, 10, 18, 255);
+    SDL_Rect full{0, 0, w, h};
+    SDL_RenderFillRect(renderer_, &full);
+
+    // Orange border
+    SDL_SetRenderDrawColor(renderer_, 220, 100, 0, 255);
+    SDL_RenderDrawRect(renderer_, &full);
+    SDL_Rect inner{1, 1, w - 2, h - 2};
+    SDL_RenderDrawRect(renderer_, &inner);
+
+    // Render one line of text, return actual pixel height used
+    auto render_text = [&](const std::string& text, int x, int y, SDL_Color col) -> int {
+        if (text.empty()) return lh;
+        SDL_Surface* s = TTF_RenderUTF8_Blended(font_, text.c_str(), col);
+        if (!s) return lh;
+        SDL_Texture* t = SDL_CreateTextureFromSurface(renderer_, s);
+        int tw = s->w, th = s->h;
+        SDL_FreeSurface(s);
+        if (!t) return lh;
+        SDL_Rect dst{x, y, tw, th};
+        SDL_RenderCopy(renderer_, t, nullptr, &dst);
+        SDL_DestroyTexture(t);
+        return th + 2;
+    };
+
+    // Word-wrap: split `text` into lines that fit within max_text_w pixels.
+    // Returns list of wrapped lines.
+    auto wrap_text = [&](const std::string& text) -> std::vector<std::string> {
+        std::vector<std::string> lines;
+        std::string current;
+        std::istringstream ss(text);
+        std::string word;
+        while (ss >> word) {
+            std::string candidate = current.empty() ? word : current + " " + word;
+            int tw = 0, th = 0;
+            TTF_SizeUTF8(font_, candidate.c_str(), &tw, &th);
+            if (tw <= max_text_w) {
+                current = std::move(candidate);
+            } else {
+                if (!current.empty()) lines.push_back(current);
+                current = word;
+            }
+        }
+        if (!current.empty()) lines.push_back(current);
+        if (lines.empty()) lines.push_back("");
+        return lines;
+    };
+
+    int tx = pad + 2;
+    int y  = pad;
+
+    // Title
+    y += render_text("Startup Diagnostics", tx, y, {255, 140, 0, 255});
+    SDL_SetRenderDrawColor(renderer_, 150, 70, 0, 255);
+    SDL_RenderDrawLine(renderer_, pad, y, w - pad, y);
+    y += 4;
+
+    // Warnings with word-wrap
+    int footer_h = lh + 10;
+    for (const auto& warn : startup_warnings_) {
+        auto lines = wrap_text("! " + warn);
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (y + lh > h - footer_h) break; // don't overlap footer
+            SDL_Color col = (i == 0) ? SDL_Color{255, 220, 60, 255}
+                                     : SDL_Color{200, 180, 50, 255};
+            // indent continuation lines
+            int indent = (i > 0) ? pad : 0;
+            y += render_text(lines[i], tx + indent, y, col);
+        }
+        y += 2;
+    }
+
+    // Footer pinned to bottom
+    int fy = h - lh - 6;
+    SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
+    SDL_RenderDrawLine(renderer_, pad, fy - 4, w - pad, fy - 4);
+    render_text("ESC / Enter — dismiss", tx, fy, {120, 120, 120, 255});
+}
+
 void App::run() {
     constexpr int TARGET_FPS = 30;
     constexpr uint64_t FRAME_US = 1'000'000 / TARGET_FPS;
     constexpr uint64_t ANALYTICS_INTERVAL_US = 10'000'000; // 10 sec
     constexpr uint64_t DB_FLUSH_INTERVAL_US  =  5'000'000; //  5 sec
     constexpr uint64_t ACTIVE_MARK_INTERVAL_US = 2'000'000; // 2 sec
+
+    // Run startup diagnostics — checks monitor mode, permissions, capture status
+    check_startup();
 
     // Use window surface size — SDL_GetWindowSize returns 0 on KMS/DRM (Beepy)
     // until the compositor sends a resize event; surface->w/h is always correct.
@@ -896,12 +1071,14 @@ void App::run() {
             if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_RESIZED ||
                     ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    cur_w = ev.window.data1;
-                    cur_h = ev.window.data2;
                     // Recreate SoftwareRenderer on the new window surface
                     if (renderer_) { SDL_DestroyRenderer(renderer_); renderer_ = nullptr; }
                     SDL_Surface* surf = SDL_GetWindowSurface(window_);
                     if (surf) {
+                        // Use surface physical dimensions — ev.window.data1/data2 are
+                        // logical pixels on HiDPI displays and may not match the surface.
+                        cur_w = surf->w;
+                        cur_h = surf->h;
                         renderer_ = SDL_CreateSoftwareRenderer(surf);
                         if (renderer_) SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
                     }
@@ -924,7 +1101,7 @@ void App::run() {
                     layout_.set_bounds(static_cast<float>(gw), static_cast<float>(cur_h));
                 }
             }
-            if (ev.type == SDL_TEXTINPUT) {
+            if (!startup_dialog_open_ && ev.type == SDL_TEXTINPUT) {
                 if (alias_mode_) {
                     alias_buf_ += ev.text.text;
                 } else if (search_mode_) {
@@ -934,6 +1111,14 @@ void App::run() {
 
             if (ev.type == SDL_KEYDOWN) {
                 SDL_Keycode sym = ev.key.keysym.sym;
+
+                // Startup dialog: ESC closes it, all other keys ignored while open
+                if (startup_dialog_open_) {
+                    if (sym == SDLK_ESCAPE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER)
+                        startup_dialog_open_ = false;
+                    continue;
+                }
+
                 if (alias_mode_) {
                     if (sym == SDLK_BACKSPACE) {
                         if (!alias_buf_.empty()) alias_buf_.pop_back();
@@ -1066,7 +1251,8 @@ void App::run() {
                 }
             }
 
-            graph_view_.handle_event(ev);
+            if (!startup_dialog_open_)
+                graph_view_.handle_event(ev);
         }
 
         // Update selected node from graph view
@@ -1184,8 +1370,16 @@ void App::run() {
             graph_view_.set_crack_info({cs.ssid, cs.speed_kps, aggressive_mode_, aggr_target_label_, cs.engine_label});
         }
 
-        // Build crack list entries for overlay
+        // Build crack list entries for overlay; also update Node crack_running/crack_speed_kps
         {
+            // First clear crack_running on all AP nodes so stale state doesn't linger
+            for (auto& [id, n] : graph_.nodes()) {
+                if (n.type == NodeType::AP) {
+                    n.crack_running   = false;
+                    n.crack_speed_kps = 0;
+                }
+            }
+
             std::vector<GraphView::CrackListEntry> entries;
             entries.reserve(handshake_saver_.crack_jobs().size());
             for (const auto& j : handshake_saver_.crack_jobs()) {
@@ -1195,6 +1389,7 @@ void App::run() {
                 e.handshake_count = j.handshake_count;
                 e.spin_frame      = j.spin_frame;
                 e.password        = j.password;
+                e.speed_kps       = j.cached_speed_kps;
                 using JS = CrackJob::Status;
                 using ES = GraphView::CrackListEntry::Status;
                 switch (j.status) {
@@ -1204,6 +1399,18 @@ void App::run() {
                     case JS::NotFound: e.status = ES::NotFound; break;
                 }
                 entries.push_back(std::move(e));
+
+                // Propagate active crack state to graph node
+                if (j.status == JS::Queued || j.status == JS::Running) {
+                    for (auto& [id, n] : graph_.nodes()) {
+                        if (n.type == NodeType::AP && n.label == j.bssid) {
+                            n.crack_running   = true;
+                            n.crack_speed_kps = j.cached_speed_kps;
+                            n.crack_not_found = false; // clear stale "not found" while new attempt runs
+                            break;
+                        }
+                    }
+                }
             }
             graph_view_.set_crack_list(entries);
         }
@@ -1258,6 +1465,10 @@ void App::run() {
                         hopper_ ? hopper_->channel_count()   : 0,
                         hopper_ ? hopper_->is_locked()        : false,
                         hopper_ ? hopper_->locked_channel()   : 0);
+
+        // Startup diagnostic overlay — drawn on top of everything
+        if (startup_dialog_open_)
+            render_startup_dialog(cur_w, cur_h);
 
         SDL_RenderPresent(renderer_);
         SDL_UpdateWindowSurface(window_);

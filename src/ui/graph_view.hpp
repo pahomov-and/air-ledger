@@ -55,6 +55,7 @@ public:
         int spin_frame{0};       // 0-3 for spinner animation
         enum class Status { Queued, Running, Found, NotFound } status{Status::Queued};
         std::string password;    // filled when Found
+        uint64_t speed_kps{0};  // crack speed, k/s (0 = unknown)
     };
     void toggle_crack_list() { show_crack_list_ = !show_crack_list_; crack_list_cursor_ = 0; show_ap_list_ = false; }
     void close_crack_list()  { show_crack_list_ = false; }

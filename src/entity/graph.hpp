@@ -43,6 +43,8 @@ struct Node {
     std::string password;               // latest cracked password (compat)
     std::vector<std::string> passwords; // all cracked passwords for this AP
     bool crack_not_found{false};        // cracker exhausted wordlist, no key
+    bool crack_running{false};          // crack job currently active (queued or running)
+    uint64_t crack_speed_kps{0};        // last known crack speed (k/s), 0 = unknown
     int  anomaly_count{0};              // total anomaly events involving this MAC
     int  assoc_ap_count{0};            // number of distinct APs this client associated with
     NodeId ssid_id{0};

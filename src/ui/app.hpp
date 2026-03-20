@@ -130,6 +130,13 @@ private:
     void resize_font(int delta);
     void handle_click(int sx, int sy);
 
+    // Startup diagnostic dialog
+    std::vector<std::string> startup_warnings_;
+    std::vector<std::string> startup_wordlists_; // copy of wordlist paths for startup check
+    bool startup_dialog_open_{false};
+    void check_startup();
+    void render_startup_dialog(int w, int h);
+
     // Anomaly detection
     AnomalyDetector anomaly_detector_;
     std::vector<AnomalyEvent> anomaly_log_;  // last 100 events (newest first)

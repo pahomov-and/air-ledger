@@ -180,6 +180,15 @@ void Sidebar::render_ap(const Node& n, const Graph& graph, int x, int& y) {
             draw_text(std::format("PW:{}", pw), x, y, {0, 255, 0, 255});
     } else if (!n.password.empty()) {
         draw_text(std::format("PW:{}", n.password), x, y, {0, 255, 0, 255});
+    }
+    if (n.crack_running) {
+        static const char* SPIN = "|/-\\";
+        uint32_t spin = (SDL_GetTicks() / 250) % 4;
+        if (n.crack_speed_kps > 0)
+            draw_text(std::format("Crack:{} {}k/s", SPIN[spin], n.crack_speed_kps),
+                      x, y, {255, 220, 0, 255});
+        else
+            draw_text(std::format("Crack:{} ...", SPIN[spin]), x, y, {255, 220, 0, 255});
     } else if (n.crack_not_found) {
         draw_text("PW: not found", x, y, {255, 80, 80, 255});
     }
