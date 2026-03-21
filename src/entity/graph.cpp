@@ -176,7 +176,12 @@ void Graph::add_beacon(NodeId ap, NodeId ssid, int channel, uint8_t ht_oper, con
         it->second.channel = channel;
         it->second.chan_ht_oper = ht_oper;
         it->second.security = security;
-        it->second.ssid_id = ssid;
+        const Node* old_ssid = get_node(it->second.ssid_id);
+        const Node* new_ssid = get_node(ssid);
+        bool old_hidden = !old_ssid || old_ssid->label.empty() || old_ssid->label == "<hidden>";
+        bool new_hidden = !new_ssid || new_ssid->label.empty() || new_ssid->label == "<hidden>";
+        if (it->second.ssid_id == 0 || old_hidden || !new_hidden)
+            it->second.ssid_id = ssid;
     }
     // This SSID is actively broadcast by an AP — not a ghost
     if (auto it = nodes_.find(ssid); it != nodes_.end())

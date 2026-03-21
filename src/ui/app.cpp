@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <pcap/pcap.h>
 
 static bool resolve_exec_path(const char* name_or_path, std::string& out) {
     if (!name_or_path || !*name_or_path) return false;
@@ -55,6 +56,10 @@ static std::string resolve_tool(const char* env_name, const char* default_name) 
     return std::string(default_name) + " (missing)";
 }
 
+static bool tool_missing(const std::string& resolved) {
+    return resolved.find(" (missing)") != std::string::npos;
+}
+
 static const char* iw_bin() {
     const char* p = std::getenv("AIR_LEDGER_IW_BIN");
     return (p && *p) ? p : "iw";
@@ -63,6 +68,10 @@ static const char* iw_bin() {
 static const char* aireplay_bin() {
     const char* p = std::getenv("AIR_LEDGER_AIREPLAY_BIN");
     return (p && *p) ? p : "aireplay-ng";
+}
+
+static bool is_beepy_profile(UiProfile p) {
+    return p == UiProfile::Beepy || p == UiProfile::BeepyWindow;
 }
 
 static int autoscaled_font_size(int h, bool beepy_profile) {
@@ -147,7 +156,7 @@ void App::resize_font(int delta) {
     font_size_ = new_size;
     int win_w = 0, win_h = 0;
     SDL_GetWindowSize(window_, &win_w, &win_h);
-    bool beepy = (ui_profile_ == UiProfile::Beepy);
+    bool beepy = is_beepy_profile(ui_profile_);
     sidebar_w_ = sidebar_width_for(font_size_, win_w, win_h, beepy);
     if (font_) { TTF_CloseFont(font_); font_ = nullptr; }
     load_font();  // TTF_HINTING_MONO set inside load_font
@@ -178,6 +187,10 @@ bool App::init(const std::string& iface, const std::string& db_path) {
         win_flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
         win_w = 0;
         win_h = 0;
+    } else if (ui_profile_ == UiProfile::BeepyWindow) {
+        win_flags = 0;
+        win_w = 400;
+        win_h = 240;
     } else {
         win_flags = SDL_WINDOW_RESIZABLE;
     }
@@ -208,15 +221,18 @@ bool App::init(const std::string& iface, const std::string& db_path) {
     // Auto-scale font to screen size: comfortable on both Beepy (240px) and desktop
     int actual_w = win_surface->w;
     int actual_h = win_surface->h;
-    bool beepy = (ui_profile_ == UiProfile::Beepy);
+    bool beepy = is_beepy_profile(ui_profile_);
     font_size_ = autoscaled_font_size(actual_h, beepy);
     sidebar_w_ = sidebar_width_for(font_size_, actual_w, actual_h, beepy);
 
     load_font();
 
     // Init UI components using actual window size (fullscreen → real display dims)
+    const char* ui_profile_name =
+        ui_profile_ == UiProfile::Beepy ? "beepy" :
+        ui_profile_ == UiProfile::BeepyWindow ? "beepy-window" : "auto";
     std::fprintf(stderr, "[app] display: %dx%d  font: %dpx  ui_profile=%s\n",
-                 actual_w, actual_h, font_size_, beepy ? "beepy" : "auto");
+                 actual_w, actual_h, font_size_, ui_profile_name);
     int graph_w = actual_w - sidebar_w_;
     int graph_h = actual_h;
     graph_view_.init(renderer_, font_);
@@ -540,6 +556,20 @@ void App::run_analytics() {
             std::fprintf(stderr, "[app] crack exhausted (no key): %s\n", r.bssid.c_str());
         }
     }
+
+    for (auto& ev : handshake_saver_.drain_runtime_events()) {
+        switch (ev.level) {
+            case HandshakeSaver::RuntimeEvent::Level::Error:
+                push_error(ev.text);
+                break;
+            case HandshakeSaver::RuntimeEvent::Level::Warning:
+                push_warning(ev.text);
+                break;
+            default:
+                push_notice(ev.text, 5'000'000ULL);
+                break;
+        }
+    }
 }
 
 void App::handle_click(int sx, int sy) {
@@ -592,7 +622,7 @@ void App::render_action_bar(int w, int h) {
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
     SDL_RenderDrawLine(renderer_, 0, h - bar_h, w, h - bar_h);
 
-    bool compact = (w <= 500 || h <= 300 || ui_profile_ == UiProfile::Beepy);
+    bool compact = (w <= 500 || h <= 300 || is_beepy_profile(ui_profile_));
     std::string left;
     if (graph_view_.ap_list_visible()) left = compact ? "AP: Up/Dn Tab Enter d p/Esc" : "AP LIST: Up/Dn/Tab nav  Enter select  d deauth  p/Esc close";
     else if (graph_view_.crack_list_visible()) left = compact ? "CRK: Up/Dn Tab Enter k/Esc" : "CRACK: Up/Dn/Tab nav  Enter select AP  k/Esc close";
@@ -611,9 +641,7 @@ void App::render_action_bar(int w, int h) {
     }
 
     std::string right = "AC:" + std::string(handshake_saver_.auto_crack_enabled() ? "on" : "off")
-        + " IF:" + iface_diag_type_
-        + " CH:" + (iface_diag_channel_ > 0 ? std::to_string(iface_diag_channel_) : "?")
-        + " TX:" + iface_diag_txpower_;
+        + " CH:" + (iface_diag_channel_ > 0 ? std::to_string(iface_diag_channel_) : "?");
 
     auto draw_text = [&](const std::string& txt, int x, SDL_Color col) {
         SDL_Surface* s = TTF_RenderUTF8_Blended(font_, txt.c_str(), col);
@@ -1162,6 +1190,10 @@ void App::export_json(NodeId focus) {
 
 void App::check_startup() {
     startup_warnings_.clear();
+    std::string hc = resolve_tool("AIR_LEDGER_HASHCAT_BIN", "hashcat");
+    std::string ac = resolve_tool("AIR_LEDGER_AIRCRACK_BIN", "aircrack-ng");
+    std::string ar = resolve_tool("AIR_LEDGER_AIREPLAY_BIN", "aireplay-ng");
+    std::string iw = resolve_tool("AIR_LEDGER_IW_BIN", "iw");
 
     // pcap file playback — skip live-interface checks
     auto ends_with = [](const std::string& s, const std::string& suffix) {
@@ -1215,16 +1247,47 @@ void App::check_startup() {
             startup_warnings_.push_back(
                 "Not running as root. Packet capture requires root or CAP_NET_RAW.");
         }
+
+        // 4. Passive monitor/injection readiness probe via pcap linktype.
+        char errbuf[PCAP_ERRBUF_SIZE]{};
+        pcap_t* p = pcap_open_live(iface_name_.c_str(), 256, 1, 100, errbuf);
+        if (!p) {
+            startup_warnings_.push_back(
+                "pcap open failed on '" + iface_name_ + "': " + std::string(errbuf));
+        } else {
+            int dlt = pcap_datalink(p);
+            if (dlt != DLT_IEEE802_11_RADIO && dlt != DLT_IEEE802_11) {
+                startup_warnings_.push_back(
+                    "Interface '" + iface_name_ + "' linktype=" + std::to_string(dlt)
+                    + " (expected radiotap/802.11 for monitor+inject)");
+            }
+            pcap_close(p);
+        }
     }
 
-    // 4. Capture thread not started — open() failed
+    // 5. Capture thread not started — open() failed
     if (!capture_thread_.joinable()) {
         startup_warnings_.push_back(
             "Capture failed to open on '" + iface_name_ +
             "'. Check interface name and permissions.");
     }
 
-    // 5. Wordlists missing (if handshake capture configured)
+    // 6. External tools and crack backends.
+    if (tool_missing(iw))
+        startup_warnings_.push_back("Tool missing: iw (channel lock / hopper reset will fail)");
+    if (tool_missing(ar))
+        startup_warnings_.push_back("Tool missing: aireplay-ng (external deauth unavailable)");
+    if (tool_missing(ac) && !builtin_cracker_available())
+        startup_warnings_.push_back("No CPU cracker available: both builtin OpenSSL and aircrack-ng are unavailable");
+#ifdef HAVE_GPU_CRACK
+    if (tool_missing(hc))
+        startup_warnings_.push_back("Tool missing: hashcat (GPU cracking will fall back)");
+#else
+    if (!tool_missing(hc))
+        startup_warnings_.push_back("hashcat binary exists, but this build has GPU crack support disabled");
+#endif
+
+    // 7. Wordlists missing (if handshake capture configured)
     for (const auto& wl : startup_wordlists_) {
         if (::access(wl.c_str(), R_OK) != 0) {
             startup_warnings_.push_back("Wordlist not found: " + wl);
@@ -1245,6 +1308,7 @@ void App::render_startup_dialog(int w, int h) {
     int lh  = TTF_FontHeight(font_) + 2;
     int pad = std::max(4, w / 50); // ~8px on 400px screen, ~20px on 1000px
     int max_text_w = w - pad * 2 - 4;
+    bool compact = (w <= 500 || h <= 300 || is_beepy_profile(ui_profile_));
 
     // Full-screen background
     SDL_SetRenderDrawColor(renderer_, 10, 10, 18, 255);
@@ -1295,19 +1359,52 @@ void App::render_startup_dialog(int w, int h) {
         return lines;
     };
 
+    auto compact_warn = [&](const std::string& warn) {
+        if (!compact) return warn;
+        std::string s = warn;
+        auto replace_once = [&](const char* from, const char* to) {
+            size_t p = s.find(from);
+            if (p != std::string::npos) s.replace(p, std::strlen(from), to);
+        };
+        replace_once("Interface '", "IF ");
+        replace_once("' is NOT in monitor mode", " not monitor");
+        replace_once("Run: iw dev ", "fix: iw ");
+        replace_once(" set type monitor", " set type monitor");
+        replace_once("Not running as root. Packet capture requires root or CAP_NET_RAW.", "Need root/CAP_NET_RAW");
+        replace_once("Capture failed to open on '", "Capture open failed: ");
+        replace_once("'. Check interface name and permissions.", "");
+        replace_once("Tool missing: ", "");
+        replace_once(" (channel lock / hopper reset will fail)", " missing");
+        replace_once(" (external deauth unavailable)", " missing");
+        replace_once("No CPU cracker available: both builtin OpenSSL and aircrack-ng are unavailable", "No CPU cracker");
+        replace_once("Handshake capture enabled but no --wordlist specified. Handshakes will be saved but not cracked.",
+                     "No wordlist: save only");
+        replace_once("hashcat binary exists, but this build has GPU crack support disabled",
+                     "hashcat present, GPU build off");
+        if (s.size() > 64) s = s.substr(0, 63) + "~";
+        return s;
+    };
+
     int tx = pad + 2;
     int y  = pad;
 
     // Title
-    y += render_text("Startup Diagnostics", tx, y, {255, 140, 0, 255});
+    y += render_text(compact ? "Startup Check" : "Startup Diagnostics", tx, y, {255, 140, 0, 255});
     SDL_SetRenderDrawColor(renderer_, 150, 70, 0, 255);
     SDL_RenderDrawLine(renderer_, pad, y, w - pad, y);
     y += 4;
 
     // Warnings with word-wrap
     int footer_h = lh + 10;
-    for (const auto& warn : startup_warnings_) {
-        auto lines = wrap_text("! " + warn);
+    int shown_warnings = 0;
+    int hidden_warnings = 0;
+    int max_warnings = compact ? 7 : 1000;
+    for (const auto& raw_warn : startup_warnings_) {
+        if (shown_warnings >= max_warnings) {
+            ++hidden_warnings;
+            continue;
+        }
+        auto lines = wrap_text("! " + compact_warn(raw_warn));
         for (size_t i = 0; i < lines.size(); ++i) {
             if (y + lh > h - footer_h) break; // don't overlap footer
             SDL_Color col = (i == 0) ? SDL_Color{255, 220, 60, 255}
@@ -1317,13 +1414,18 @@ void App::render_startup_dialog(int w, int h) {
             y += render_text(lines[i], tx + indent, y, col);
         }
         y += 2;
+        ++shown_warnings;
+    }
+    if (hidden_warnings > 0 && y + lh <= h - footer_h) {
+        y += render_text("! +" + std::to_string(hidden_warnings) + " more in log", tx, y,
+                         {180, 180, 180, 255});
     }
 
     // Footer pinned to bottom
     int fy = h - lh - 6;
     SDL_SetRenderDrawColor(renderer_, 60, 60, 60, 255);
     SDL_RenderDrawLine(renderer_, pad, fy - 4, w - pad, fy - 4);
-    render_text("ESC / Enter — dismiss", tx, fy, {120, 120, 120, 255});
+    render_text(compact ? "Enter/Esc: close" : "ESC / Enter — dismiss", tx, fy, {120, 120, 120, 255});
 }
 
 void App::run() {
@@ -1369,7 +1471,7 @@ void App::run() {
                     // First valid resize: recalculate font size (window was 1×1 at init)
                     if (!initial_resize_done_ && cur_w > 1 && cur_h > 1) {
                         initial_resize_done_ = true;
-                        bool beepy = (ui_profile_ == UiProfile::Beepy);
+                        bool beepy = is_beepy_profile(ui_profile_);
                         font_size_ = autoscaled_font_size(cur_h, beepy);
                         if (font_) { TTF_CloseFont(font_); font_ = nullptr; }
                         load_font();
@@ -1378,7 +1480,7 @@ void App::run() {
                         std::fprintf(stderr, "[app] initial resize: %dx%d  font: %dpx\n",
                                      cur_w, cur_h, font_size_);
                     }
-                    bool beepy = (ui_profile_ == UiProfile::Beepy);
+                    bool beepy = is_beepy_profile(ui_profile_);
                     sidebar_w_ = sidebar_width_for(font_size_, cur_w, cur_h, beepy);
                     int gw = cur_w - sidebar_w_;
                     graph_view_.set_viewport(0, 0, gw, cur_h);
@@ -1418,8 +1520,22 @@ void App::run() {
                         if (sym == SDLK_ESCAPE) cancel_search();
                         else { search_mode_ = false; SDL_StopTextInput(); }
                     }
+                } else if (graph_view_.help_visible()) {
+                    bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
+                    if (sym == SDLK_ESCAPE || sym == SDLK_i) {
+                        graph_view_.toggle_help();
+                    } else if (sym == SDLK_UP) {
+                        graph_view_.help_move(-1);
+                    } else if (sym == SDLK_DOWN) {
+                        graph_view_.help_move(+1);
+                    } else if (sym == SDLK_TAB) {
+                        if (ctrl) sidebar_.cycle_scroll(shift);
+                        else graph_view_.help_move(shift ? -1 : +1);
+                    }
                 } else if (graph_view_.crack_list_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
                     if (sym == SDLK_ESCAPE || sym == SDLK_k) {
                         graph_view_.close_crack_list();
                     } else if (sym == SDLK_UP) {
@@ -1427,17 +1543,20 @@ void App::run() {
                     } else if (sym == SDLK_DOWN) {
                         graph_view_.crack_list_move(+1);
                     } else if (sym == SDLK_TAB) {
-                        graph_view_.crack_list_move(shift ? -1 : +1);
+                        if (ctrl) sidebar_.cycle_scroll(shift);
+                        else graph_view_.crack_list_move(shift ? -1 : +1);
                     } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
                         NodeId sid = graph_view_.sidebar_focus_node(graph_);
                         if (sid) graph_view_.select_and_focus(sid, graph_);
                     }
                 } else if (graph_view_.hs_list_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
                     if (sym == SDLK_ESCAPE || sym == SDLK_j) {
                         graph_view_.close_hs_list();
                     } else if (sym == SDLK_TAB) {
-                        graph_view_.hs_list_move(shift ? -1 : +1);
+                        if (ctrl) sidebar_.cycle_scroll(shift);
+                        else graph_view_.hs_list_move(shift ? -1 : +1);
                     } else if (sym == SDLK_UP) {
                         graph_view_.hs_list_move(-1);
                     } else if (sym == SDLK_DOWN) {
@@ -1450,11 +1569,13 @@ void App::run() {
                         }
                     }
                 } else if (graph_view_.event_log_visible()) {
+                    bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
                     if (sym == SDLK_ESCAPE || sym == SDLK_y) {
                         graph_view_.close_event_log();
                     } else if (sym == SDLK_TAB) {
-                        bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
-                        graph_view_.event_log_move(shift ? -1 : +1);
+                        if (ctrl) sidebar_.cycle_scroll(shift);
+                        else graph_view_.event_log_move(shift ? -1 : +1);
                     } else if (sym == SDLK_UP) {
                         graph_view_.event_log_move(-1);
                     } else if (sym == SDLK_DOWN) {
@@ -1462,6 +1583,7 @@ void App::run() {
                     }
                 } else if (graph_view_.ap_list_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
                     if (sym == SDLK_ESCAPE || sym == SDLK_p) {
                         graph_view_.close_ap_list();
                     } else if (sym == SDLK_UP) {
@@ -1469,7 +1591,8 @@ void App::run() {
                     } else if (sym == SDLK_DOWN) {
                         graph_view_.ap_list_move(+1, graph_);
                     } else if (sym == SDLK_TAB) {
-                        graph_view_.ap_list_move(shift ? -1 : +1, graph_);
+                        if (ctrl) sidebar_.cycle_scroll(shift);
+                        else graph_view_.ap_list_move(shift ? -1 : +1, graph_);
                     } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
                         NodeId ap_id = graph_view_.ap_list_cursor_node(graph_);
                         if (ap_id) {
@@ -1486,6 +1609,7 @@ void App::run() {
                     }
                 } else if (graph_view_.anomaly_log_visible()) {
                     bool shift = (ev.key.keysym.mod & KMOD_SHIFT) != 0;
+                    bool ctrl  = (ev.key.keysym.mod & KMOD_CTRL) != 0;
                     if (sym == SDLK_ESCAPE || sym == SDLK_w) {
                         graph_view_.close_anomaly_log();
                     } else if (sym == SDLK_UP) {
@@ -1493,7 +1617,8 @@ void App::run() {
                     } else if (sym == SDLK_DOWN) {
                         graph_view_.anomaly_log_move(+1);
                     } else if (sym == SDLK_TAB) {
-                        graph_view_.anomaly_log_move(shift ? -1 : +1);
+                        if (ctrl) sidebar_.cycle_scroll(shift);
+                        else graph_view_.anomaly_log_move(shift ? -1 : +1);
                     } else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
                         NodeId sid = graph_view_.sidebar_focus_node(graph_);
                         if (sid) graph_view_.select_and_focus(sid, graph_);
@@ -1540,7 +1665,7 @@ void App::run() {
                         }
                     }
                     if (sym == SDLK_h)      { toggle_channel_hopping(); }
-                    if (sym == SDLK_F11 && ui_profile_ != UiProfile::Beepy) {
+                    if (sym == SDLK_F11 && ui_profile_ == UiProfile::Auto) {
                         Uint32 fl = SDL_GetWindowFlags(window_);
                         bool fs = (fl & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
                         SDL_SetWindowFullscreen(window_, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);

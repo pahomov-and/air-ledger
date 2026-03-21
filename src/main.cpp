@@ -55,13 +55,13 @@ static void print_usage(const char* prog) {
         "  --deauth-engine <e>    Deauth engine: builtin (default) or aireplay\n"
         "                           builtin  — pcap_inject(), no external tools\n"
         "                           aireplay — external aireplay-ng subprocess\n"
-        "  --ui-profile <p>       UI tuning profile: auto (default), beepy\n"
+        "  --ui-profile <p>       UI tuning profile: auto (default), beepy, beepy-window\n"
         "\n"
         "Controls:\n"
         "  Left click             Select node\n"
         "  Scroll / z / x         Zoom in/out\n"
         "  Arrow keys             Pan view\n"
-        "  F11                    Toggle fullscreen (desktop profile)\n"
+        "  F11                    Toggle fullscreen (auto profile only)\n"
         "  Middle drag            Pan view with mouse\n"
         "  h                      Toggle channel hopping\n"
         "  +/-                    Dwell time ±100ms\n"
@@ -178,8 +178,9 @@ int main(int argc, char* argv[]) {
             std::string p = argv[i];
             if (p == "auto") ui_profile = UiProfile::Auto;
             else if (p == "beepy") ui_profile = UiProfile::Beepy;
+            else if (p == "beepy-window") ui_profile = UiProfile::BeepyWindow;
             else {
-                std::fprintf(stderr, "Unknown ui profile '%s'. Use: auto, beepy\n", p.c_str());
+                std::fprintf(stderr, "Unknown ui profile '%s'. Use: auto, beepy, beepy-window\n", p.c_str());
                 return 1;
             }
         } else if (arg[0] != '-') {
@@ -202,7 +203,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (ui_profile == UiProfile::Beepy) {
+    if (ui_profile == UiProfile::Beepy || ui_profile == UiProfile::BeepyWindow) {
         ::setenv("AIR_LEDGER_UI_PROFILE", "beepy", 1);
     } else {
         ::setenv("AIR_LEDGER_UI_PROFILE", "auto", 1);

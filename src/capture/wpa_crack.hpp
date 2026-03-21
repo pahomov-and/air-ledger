@@ -56,6 +56,10 @@ bool builtin_cracker_available();
 // Always returns false when HAVE_GPU_CRACK is not defined.
 bool hashcat_cracker_available();
 
+// Returns short human-readable reason for a hashcat backend/runtime failure
+// found in the given log. Empty string means no known backend error signature.
+std::string hashcat_error_reason_from_log(const std::string& log_path);
+
 // Verify a known password against a (possibly new) handshake.
 // Returns true if the password still matches the handshake MIC.
 // Used to detect password change: if false, the AP was re-keyed.

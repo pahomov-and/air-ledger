@@ -99,6 +99,30 @@ static bool scan_log_for_hashcat_error(const std::string& path) {
     return found;
 }
 
+static std::string handshake_id(const WpaHandshake& hs) {
+    static const char* HX = "0123456789ABCDEF";
+    auto hex_append = [&](std::string& out, const uint8_t* p, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            out.push_back(HX[p[i] >> 4]);
+            out.push_back(HX[p[i] & 0x0F]);
+        }
+    };
+    std::string out;
+    out.reserve(6 * 2 + 6 * 2 + 32 * 2 + 32 * 2 + 16 * 2 + 16);
+    hex_append(out, hs.ap_mac, 6);
+    out.push_back(':');
+    hex_append(out, hs.client_mac, 6);
+    out.push_back(':');
+    hex_append(out, hs.anonce, 32);
+    out.push_back(':');
+    hex_append(out, hs.snonce, 32);
+    out.push_back(':');
+    hex_append(out, hs.mic, 16);
+    out.push_back(':');
+    out += std::to_string(hs.eapol_frame.size());
+    return out;
+}
+
 // Scan log for most recent speed line: "[00:00:15] 12345 keys tested (1234.5 k/s)"
 static uint64_t scan_log_for_speed(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "r");
@@ -247,6 +271,7 @@ void HandshakeSaver::feed(const RawFrame& raw, const ParsedFrame& parsed) {
 
         if (config_.auto_crack && !config_.wordlists.empty()) {
             CrackJob* job = find_job(bssid);
+            const std::string new_hs_id = handshake_id(completed_hs);
             if (!job) {
                 // New job
                 CrackJob j;
@@ -254,29 +279,33 @@ void HandshakeSaver::feed(const RawFrame& raw, const ParsedFrame& parsed) {
                 j.ssid            = s.ssid;
                 j.pcap_path       = s.dir + "/handshake.pcap";
                 j.handshake       = completed_hs;
+                j.last_handshake_id = new_hs_id;
                 j.handshake_count = 1;
                 j.status          = CrackJob::Status::Queued;
+                j.last_reason     = "new handshake captured";
+                emit_event(RuntimeEvent::Level::Info,
+                           "Handshake queued: " + (s.ssid.empty() ? bssid : s.ssid));
                 jobs_.push_back(std::move(j));
                 advance_queue();
             } else {
                 job->handshake_count++;
                 job->ssid = s.ssid;
+                bool same_handshake = !job->last_handshake_id.empty()
+                                   && job->last_handshake_id == new_hs_id;
 
-                // Compare SNonce: same nonce = same 4-way exchange, nothing new to crack.
-                bool same_snonce = job->handshake.has_m2 &&
-                                   memcmp(job->handshake.snonce, completed_hs.snonce, 32) == 0;
-
-                if (same_snonce) {
+                if (same_handshake) {
                     // Already have this exact exchange — skip re-crack.
                     const char* prev =
                         job->status == CrackJob::Status::Found    ? "found"     :
                         job->status == CrackJob::Status::NotFound ? "not_found" :
                         job->status == CrackJob::Status::Running  ? "running"   : "queued";
-                    std::fprintf(stderr, "[hs] %s  same SNonce (prev=%s) — skip\n",
+                    std::fprintf(stderr, "[hs] %s  same handshake (prev=%s) — skip\n",
                                  bssid.c_str(), prev);
                 } else {
-                    // Different SNonce = new exchange (new reconnection).
+                    // New exchange on the same BSSID. This must not be skipped:
+                    // password may have changed while keeping the same AP.
                     job->handshake = completed_hs;
+                    job->last_handshake_id = new_hs_id;
                     if (job->status == CrackJob::Status::Found) {
                         // New handshake (different client or reconnect).
                         // Verify known password against it: same password → skip,
@@ -290,21 +319,37 @@ void HandshakeSaver::feed(const RawFrame& raw, const ParsedFrame& parsed) {
                             // Can't create temp file — just skip to be safe.
                             std::fprintf(stderr, "[hs] %s  new SNonce, cannot create verify wordlist — skip\n",
                                 bssid.c_str());
+                            emit_event(RuntimeEvent::Level::Warning,
+                                       "Handshake changed for " + bssid
+                                       + ", but verify wordlist could not be created");
                         } else {
-                            std::fprintf(stderr, "[hs] %s  new SNonce, verifying known password '%s'\n",
+                            std::fprintf(stderr, "[hs] %s  new handshake, verifying known password '%s'\n",
                                 bssid.c_str(), job->password.c_str());
                             clear_verify_wordlist(*job);
                             job->verify_wordlist_path = vwl;
                             job->handshake = completed_hs;
                             job->status    = CrackJob::Status::Queued;
+                            job->last_reason = "handshake changed; verifying known password";
+                            emit_event(RuntimeEvent::Level::Info,
+                                       "Handshake changed for " + bssid
+                                       + " — verifying previous password");
                             advance_queue();
                         }
                     } else if (job->status == CrackJob::Status::NotFound) {
                         // Previous wordlist exhausted — retry with fresh handshake.
-                        std::fprintf(stderr, "[hs] %s  new SNonce, re-queuing (prev=not_found)\n",
+                        std::fprintf(stderr, "[hs] %s  new handshake, re-queuing (prev=not_found)\n",
                             bssid.c_str());
                         job->status = CrackJob::Status::Queued;
+                        job->last_reason = "fresh handshake after previous not_found";
+                        emit_event(RuntimeEvent::Level::Info,
+                                   "Fresh handshake re-queued: " + bssid);
                         advance_queue();
+                    } else if (job->status == CrackJob::Status::Running) {
+                        job->last_reason = "new handshake captured while previous crack still running";
+                        emit_event(RuntimeEvent::Level::Info,
+                                   "Fresh handshake captured while crack still running: " + bssid);
+                    } else {
+                        job->last_reason = "new handshake updated queued job";
                     }
                     // If Queued/Running: nonces updated, let current job finish first.
                 }
@@ -355,6 +400,14 @@ void HandshakeSaver::advance_queue() {
                 : (verify_wl_vec = {j.verify_wordlist_path}, verify_wl_vec);
 
         CrackEngine engine = j.force_builtin ? CrackEngine::Builtin : config_.crack_engine;
+        j.requested_engine.clear();
+        switch (config_.crack_engine) {
+#ifdef HAVE_GPU_CRACK
+            case CrackEngine::Hashcat:  j.requested_engine = "GPU"; break;
+#endif
+            case CrackEngine::Aircrack: j.requested_engine = "air"; break;
+            default:                    j.requested_engine = "CPU"; break;
+        }
         bool ok = launch_crack_job(engine, j.handshake,
                                    j.pcap_path, wordlists, j.log_path);
         if (ok) {
@@ -376,8 +429,17 @@ void HandshakeSaver::advance_queue() {
             }
             std::fprintf(stderr, "[hs] %s  crack STARTED  engine=%s  log=%s\n",
                          j.bssid.c_str(), j.actual_engine.c_str(), j.log_path.c_str());
+            if (j.force_builtin && !j.last_reason.empty()) {
+                emit_event(RuntimeEvent::Level::Warning,
+                           "Crack fallback for " + j.bssid + ": " + j.last_reason);
+            } else {
+                emit_event(RuntimeEvent::Level::Info,
+                           "Crack started: " + j.bssid + " [" + j.actual_engine + "]");
+            }
         } else {
             std::fprintf(stderr, "[hs] %s  crack launch FAILED\n", j.bssid.c_str());
+            emit_event(RuntimeEvent::Level::Error,
+                       "Crack launch failed: " + j.bssid);
         }
         return; // only start one at a time
     }
@@ -418,11 +480,14 @@ std::vector<HandshakeSaver::CrackResult> HandshakeSaver::poll_results() {
             if (j.actual_engine == "GPU" && scan_log_for_hashcat_error(j.log_path)) {
                 // Hashcat backend failed (driver/runtime/compiler). Re-queue this
                 // job and force builtin CPU engine to avoid false "not found".
+                std::string reason = hashcat_error_reason_from_log(j.log_path);
+                if (reason.empty()) reason = "unknown hashcat backend error";
                 std::fprintf(stderr,
-                             "[hs] hashcat backend error for bssid=%s — switching job to builtin CPU\n",
-                             j.bssid.c_str());
+                             "[hs] hashcat backend error for bssid=%s (%s) — switching job to builtin CPU\n",
+                             j.bssid.c_str(), reason.c_str());
                 clear_verify_wordlist(j);
                 j.force_builtin = true;
+                j.last_reason = reason;
                 j.status = CrackJob::Status::Queued;
                 j.log_path.clear();
                 j.cached_speed_kps = 0;
@@ -436,11 +501,15 @@ std::vector<HandshakeSaver::CrackResult> HandshakeSaver::poll_results() {
                 std::fprintf(stderr, "[hs] VERIFY FAIL  bssid=%s  known pw invalid — AP re-keyed, re-cracking\n",
                              j.bssid.c_str());
                 j.password.clear();
+                j.last_reason = "known password invalid for fresh handshake";
                 j.status = CrackJob::Status::Queued;
+                emit_event(RuntimeEvent::Level::Warning,
+                           "Password changed on " + j.bssid + " — re-cracking");
             } else {
                 j.status = CrackJob::Status::NotFound;
                 std::fprintf(stderr, "[hs] KEY NOT FOUND  bssid=%s  ssid=%s\n",
                              j.bssid.c_str(), j.ssid.c_str());
+                j.last_reason = "wordlists exhausted";
                 out.push_back({j.bssid, j.ssid, "", false});
             }
             need_advance = true;
@@ -461,6 +530,7 @@ std::vector<HandshakeSaver::CrackResult> HandshakeSaver::poll_results() {
                 if (empty) {
                     std::fprintf(stderr, "[hs] crack log empty after 15s — engine failed silently, re-queuing\n");
                     clear_verify_wordlist(j);
+                    j.last_reason = "engine failed silently (empty log after 15s)";
                     j.status = CrackJob::Status::Queued;
                     j.log_path.clear();
                     j.cached_speed_kps = 0;
@@ -502,6 +572,12 @@ std::vector<HandshakeSaver::NewHandshake> HandshakeSaver::drain_new_handshakes()
     return out;
 }
 
+std::vector<HandshakeSaver::RuntimeEvent> HandshakeSaver::drain_runtime_events() {
+    std::vector<RuntimeEvent> out;
+    out.swap(runtime_events_);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Legacy crack status (for top-left "Crk:" indicator in app.cpp)
 // ---------------------------------------------------------------------------
@@ -519,6 +595,10 @@ HandshakeSaver::CrackStatus HandshakeSaver::current_crack_status() const {
         }
     }
     return CrackStatus{};
+}
+
+void HandshakeSaver::emit_event(RuntimeEvent::Level level, const std::string& text) {
+    runtime_events_.push_back({level, text});
 }
 
 // ---------------------------------------------------------------------------

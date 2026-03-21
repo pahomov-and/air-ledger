@@ -89,6 +89,23 @@ static bool resolve_aircrack_binary(std::string& out) {
     return find_executable_in_path("aircrack-ng", &out);
 }
 
+static std::string classify_hashcat_error_line(const char* line) {
+    if (!line || !*line) return "";
+    if (std::strstr(line, "EXEC_FAILED")) return "hashcat exec failed";
+    if (std::strstr(line, "HIPRTC_ERROR")) return "HIP runtime compile error";
+    if (std::strstr(line, "clBuildProgram")) return "OpenCL kernel build failed";
+    if (std::strstr(line, "Aborting session due to kernel build")) return "hashcat kernel build aborted";
+    if (std::strstr(line, "No devices found/left")) return "no GPU devices found";
+    if (std::strstr(line, "No OpenCL-compatible, HIP-compatible or CUDA-compatible"))
+        return "no GPU backend runtime available";
+    if (std::strstr(line, "ATTENTION! No OpenCL or CUDA installation found."))
+        return "OpenCL/CUDA runtime not installed";
+    if (std::strstr(line, "Kernel") && std::strstr(line, "build failed"))
+        return "GPU kernel build failed";
+    if (std::strstr(line, "HASHCAT BACKEND ERROR")) return "hashcat backend error";
+    return "";
+}
+
 // ---------------------------------------------------------------------------
 // EAPOL field extraction
 // ---------------------------------------------------------------------------
@@ -681,6 +698,22 @@ bool hashcat_cracker_available() {
 #else
     return false;
 #endif
+}
+
+std::string hashcat_error_reason_from_log(const std::string& log_path) {
+    FILE* f = std::fopen(log_path.c_str(), "r");
+    if (!f) return "";
+    char line[1024];
+    std::string reason;
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string classified = classify_hashcat_error_line(line);
+        if (!classified.empty()) {
+            reason = std::move(classified);
+            break;
+        }
+    }
+    std::fclose(f);
+    return reason;
 }
 
 bool launch_crack_job(CrackEngine engine,

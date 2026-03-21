@@ -24,7 +24,7 @@
 #include <string>
 
 enum class DeauthEngine { Builtin, Aireplay };
-enum class UiProfile { Auto, Beepy };
+enum class UiProfile { Auto, Beepy, BeepyWindow };
 
 class App {
 public:

@@ -659,7 +659,7 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
             SDL_SetRenderDrawColor(renderer_, 0, 0, 0, overlay_alpha());
             SDL_RenderFillRect(renderer_, &clip);
 
-            // Single-column help, scrollable with Space
+            // Single-column help, scrollable with Up/Down/Tab like the list overlays
             // Prefix chars:
             //   '=' header (cyan)
             //   '-' separator line
@@ -670,10 +670,13 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                 " z / x      zoom in / out",
                 " arrows     pan view",
                 " 0          fit all nodes",
+                " F11        fullscreen (auto only)",
+                " desktop:    --ui-profile beepy-window",
                 " h          channel hop on/off",
                 " + / -      hop dwell +/- 50ms",
                 " l          labels toggle",
                 " Tab        cycle nodes",
+                " Ctrl+Tab   sidebar scroll",
                 " Esc        deselect",
                 "-",
                 " p          AP list overlay",
@@ -682,7 +685,10 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                 " w          anomaly log",
                 " y          event log",
                 " i          help toggle",
-                " [space]    next page",
+                " Up/Dn      scroll",
+                " Tab/sTab   scroll",
+                " Ctrl+Tab   sidebar scroll",
+                " i / Esc    close",
                 "-",
                 " d          deauth selected AP",
                 " Ctrl+d     inject diagnostic (selected AP)",
@@ -785,17 +791,15 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                 y += lh + 2;
             }
 
-            // Page indicator bottom-right
-            int page = help_scroll_ / std::max(1, visible) + 1;
-            int pages = (total + visible - 1) / std::max(1, visible);
-            std::string pg = std::format("{}/{}", page, pages);
+            // Scroll indicator bottom-right
+            std::string pg = std::format("{}/{}", std::min(total, help_scroll_ + visible), total);
             draw_line(pg.c_str(), vp_x_ + vp_w_ - static_cast<int>(pg.size()) * (lh/2) - 4,
                       vp_y_ + vp_h_ - lh - 4, {180, 180, 180, 255});
         } else {
             // Notifications stack above the hint line (newest at bottom)
             if (font_ && !notifications_.empty()) {
                 int max_chars = std::max(16, (vp_w_ - 14) / std::max(5, lh / 2));
-                int max_notifs = compact_ui ? 2 : 4;
+                int max_notifs = compact_ui ? 1 : 4;
                 int start = std::max(0, static_cast<int>(notifications_.size()) - max_notifs);
                 int ny = vp_y_ + vp_h_ - lh - 2;
                 auto wrap_lines = [&](const std::string& text) {
@@ -819,8 +823,8 @@ void GraphView::render(const Graph& graph, int /*viewport_w*/, int /*viewport_h*
                     }
                     if (!cur.empty()) out.push_back(cur);
                     if (out.empty()) out.push_back("");
-                    if (compact_ui && out.size() > 2) {
-                        out.resize(2);
+                    if (compact_ui && out.size() > 1) {
+                        out.resize(1);
                         if (!out.back().empty()) out.back().back() = '~';
                     }
                     return out;
@@ -1028,10 +1032,49 @@ static std::vector<NodeId> build_ap_list(const Graph& graph) {
     return ids;
 }
 
-static std::string clamp_line_chars(const std::string& s, int max_chars) {
-    if (max_chars < 4) return s;
-    if (static_cast<int>(s.size()) <= max_chars) return s;
-    return s.substr(0, static_cast<size_t>(max_chars - 1)) + "~";
+static std::vector<std::string> wrap_line_chars(const std::string& s, int max_chars, int max_lines = 0) {
+    std::vector<std::string> out;
+    if (s.empty()) {
+        out.push_back("");
+        return out;
+    }
+    if (max_chars < 4) {
+        out.push_back(s);
+        return out;
+    }
+
+    std::istringstream iss(s);
+    std::string cur;
+    std::string word;
+    while (iss >> word) {
+        std::string cand = cur.empty() ? word : (cur + " " + word);
+        if (static_cast<int>(cand.size()) <= max_chars) {
+            cur = std::move(cand);
+            continue;
+        }
+        if (!cur.empty()) out.push_back(cur);
+        cur.clear();
+        while (static_cast<int>(word.size()) > max_chars) {
+            out.push_back(word.substr(0, static_cast<size_t>(max_chars - 1)) + "~");
+            word.erase(0, static_cast<size_t>(max_chars - 1));
+            if (max_lines > 0 && static_cast<int>(out.size()) >= max_lines) {
+                if (!out.back().empty()) out.back().back() = '~';
+                return out;
+            }
+        }
+        cur = word;
+        if (max_lines > 0 && static_cast<int>(out.size()) >= max_lines) {
+            if (!out.back().empty()) out.back().back() = '~';
+            return out;
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    if (out.empty()) out.push_back("");
+    if (max_lines > 0 && static_cast<int>(out.size()) > max_lines) {
+        out.resize(static_cast<size_t>(max_lines));
+        if (!out.back().empty()) out.back().back() = '~';
+    }
+    return out;
 }
 
 void GraphView::ap_list_move(int delta, const Graph& g) {
@@ -1091,7 +1134,8 @@ void GraphView::draw_ap_list(const Graph& graph) {
     int scroll  = 0;
     if (cursor >= visible) scroll = cursor - visible + 1;
 
-    for (int i = scroll; i < (int)ids.size() && (i - scroll) < visible; ++i) {
+    int used_rows = 0;
+    for (int i = scroll; i < (int)ids.size() && used_rows < visible; ++i) {
         const Node* n = graph.get_node(ids[i]);
         if (!n) continue;
 
@@ -1114,9 +1158,6 @@ void GraphView::draw_ap_list(const Graph& graph) {
         std::string mac_short = n->label.size() >= 8
             ? n->label.substr(n->label.size() - 8) : n->label;
         std::string name = !n->alias.empty() ? n->alias : ssid_str;
-        // Shorter truncation to leave room for password suffix
-        if (name.size() > 11) name = name.substr(0, 10) + "~";
-
         // Build password suffix: "[pw1/pw2]" for all distinct cracked passwords
         std::string pw_suffix;
         const auto& pws = n->passwords;
@@ -1142,9 +1183,13 @@ void GraphView::draw_ap_list(const Graph& graph) {
         SDL_Color col = is_cur  ? SDL_Color{255, 255,   0, 255}   // yellow cursor
                       : has_pw  ? SDL_Color{  0, 255,   0, 255}   // green = cracked
                       :           SDL_Color{255, 255, 255, 255};
-        line = clamp_line_chars(line, max_chars);
-        draw_text(line.c_str(), vp_x_ + pad, y, col);
-        y += row;
+        auto lines = wrap_line_chars(line, max_chars - 2, 3);
+        if (used_rows + static_cast<int>(lines.size()) > visible) break;
+        for (size_t li = 0; li < lines.size(); ++li) {
+            draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, col);
+            y += row;
+        }
+        used_rows += static_cast<int>(lines.size());
     }
 
     // Footer hints — solid black background so text is fully readable over the list
@@ -1218,9 +1263,27 @@ void GraphView::draw_crack_list() {
         draw_text("(no handshakes captured)", vp_x_ + pad, y, {160, 160, 160, 255});
     } else {
         int cursor = std::clamp(crack_list_cursor_, 0, (int)crack_list_entries_.size() - 1);
-        int scroll = (cursor >= visible) ? cursor - visible + 1 : 0;
+        int scroll = 0;
+        int used_rows = 0;
+        for (int i = 0; i < cursor; ++i) {
+            const auto& e = crack_list_entries_[i];
+            std::string mac_short = e.bssid.size() >= 8 ? e.bssid.substr(e.bssid.size() - 8) : e.bssid;
+            std::string status_str;
+            using S = CrackListEntry::Status;
+            switch (e.status) {
+                case S::Queued:   status_str = "QUEUE"; break;
+                case S::Running:  status_str = e.speed_kps > 0 ? "RUN " + std::to_string(e.speed_kps) + "k/s" : "RUN"; break;
+                case S::Found:    status_str = "FOUND"; break;
+                case S::NotFound: status_str = "DONE-"; break;
+            }
+            std::string line = mac_short + " " + e.ssid + " hs:" + std::to_string(e.handshake_count) + " " + status_str;
+            if (e.status == S::Found && !e.password.empty()) line += "=" + e.password;
+            int row_lines = static_cast<int>(wrap_line_chars(line, max_chars - 2, 3).size());
+            if (used_rows + row_lines >= visible) { scroll = i; used_rows = 0; }
+            else used_rows += row_lines;
+        }
 
-        for (int i = scroll; i < (int)crack_list_entries_.size() && (i - scroll) < visible; ++i) {
+        for (int i = scroll; i < (int)crack_list_entries_.size() && used_rows < visible; ++i) {
             const auto& e = crack_list_entries_[i];
             bool is_cur = (i == cursor);
 
@@ -1262,18 +1325,21 @@ void GraphView::draw_crack_list() {
 
             // Row: "> MAC  SSID  hs:N  STATUS"
             std::string prefix = is_cur ? ">" : " ";
-            std::string ssid_trunc = e.ssid.size() > 10 ? e.ssid.substr(0, 9) + "~" : e.ssid;
             std::string line = prefix + mac_short
-                + "  " + ssid_trunc
+                + "  " + e.ssid
                 + "  hs:" + std::to_string(e.handshake_count)
                 + "  " + status_str;
             if (e.status == S::Found && !e.password.empty())
                 line += "=" + e.password;
 
             SDL_Color row_col = is_cur ? SDL_Color{255, 255, 0, 255} : status_col;
-            line = clamp_line_chars(line, max_chars);
-            draw_text(line.c_str(), vp_x_ + pad, y, row_col);
-            y += row;
+            auto lines = wrap_line_chars(line, max_chars - 2, 3);
+            if (used_rows + static_cast<int>(lines.size()) > visible) break;
+            for (size_t li = 0; li < lines.size(); ++li) {
+                draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, row_col);
+                y += row;
+            }
+            used_rows += static_cast<int>(lines.size());
         }
     }
 
@@ -1358,9 +1424,10 @@ void GraphView::draw_hs_list() {
         draw_text("(no handshakes in DB)", vp_x_ + pad, y, {160, 160, 160, 255});
     } else {
         int cursor = std::clamp(hs_list_cursor_, 0, (int)hs_list_entries_.size() - 1);
-        int scroll = (cursor >= visible) ? cursor - visible + 1 : 0;
+        int scroll = cursor;
+        int used_rows = 0;
 
-        for (int i = scroll; i < (int)hs_list_entries_.size() && (i - scroll) < visible; ++i) {
+        for (int i = scroll; i < (int)hs_list_entries_.size() && used_rows < visible; ++i) {
             const auto& e = hs_list_entries_[i];
             bool is_cur = (i == cursor);
 
@@ -1402,20 +1469,21 @@ void GraphView::draw_hs_list() {
                 ? e.client_mac.substr(e.client_mac.size() - 8) : e.client_mac;
             std::string ap_short = e.ap_bssid.size() >= 8
                 ? e.ap_bssid.substr(e.ap_bssid.size() - 8) : e.ap_bssid;
-            std::string ssid_trunc = e.ap_ssid.size() > 9 ? e.ap_ssid.substr(0, 8) + "~" : e.ap_ssid;
-
-            // Line 1: "> CLI↔AP  SSID  STATUS"
             std::string prefix = is_cur ? ">" : " ";
             std::string line = prefix + cli_short + "<>" + ap_short
-                + "  " + ssid_trunc
+                + "  " + e.ap_ssid
                 + "  " + status_str;
             if (e.status == S::Found && !e.password.empty())
                 line += "=" + e.password;
 
             SDL_Color row_col = is_cur ? SDL_Color{255, 255, 0, 255} : status_col;
-            line = clamp_line_chars(line, max_chars);
-            draw_text(line.c_str(), vp_x_ + pad, y, row_col);
-            y += row;
+            auto lines = wrap_line_chars(line, max_chars - 2, 3);
+            if (used_rows + static_cast<int>(lines.size()) > visible) break;
+            for (size_t li = 0; li < lines.size(); ++li) {
+                draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, row_col);
+                y += row;
+            }
+            used_rows += static_cast<int>(lines.size());
         }
     }
 
@@ -1499,7 +1567,7 @@ void GraphView::draw_anomaly_log() {
         int visible  = (vp_y_ + vp_h_ - y - footer_h) / row;
         if (visible < 1) visible = 1;
         int cursor = std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1);
-        int scroll = (cursor >= visible / 2) ? (cursor - visible / 2) : 0;
+        int scroll = cursor;
         int used = 0;
         for (int i = scroll; i < (int)anomaly_log_.size() && used < visible; ++i) {
             const auto& ev = anomaly_log_[i];
@@ -1531,16 +1599,19 @@ void GraphView::draw_anomaly_log() {
                 anomaly_type_name(ev.type),
                 ev.src_mac.size() >= 8 ? ev.src_mac.substr(ev.src_mac.size() - 8) : ev.src_mac,
                 age_str);
-            line = clamp_line_chars(line, max_chars);
-            draw_text(line.c_str(), vp_x_ + pad, y, col);
-            y += row;
-
-            // Description on next line, dimmer
-            std::string desc = ev.description;
-            desc = clamp_line_chars(desc, std::max(8, max_chars - 2));
-            draw_text(("  " + desc).c_str(), vp_x_ + pad, y, {160, 160, 160, 255});
-            y += row;
-            used += 2;
+            auto lines = wrap_line_chars(line, max_chars - 2, 2);
+            auto descs = wrap_line_chars(ev.description, std::max(8, max_chars - 4), 2);
+            int need = static_cast<int>(lines.size() + descs.size());
+            if (used + need > visible) break;
+            for (size_t li = 0; li < lines.size(); ++li) {
+                draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, col);
+                y += row;
+            }
+            for (const auto& desc : descs) {
+                draw_text(desc.c_str(), vp_x_ + pad + 2, y, {160, 160, 160, 255});
+                y += row;
+            }
+            used += need;
         }
     }
 
@@ -1609,10 +1680,10 @@ void GraphView::draw_event_log() {
         draw_text("(no events yet)", vp_x_ + pad, y, {180, 180, 180, 255});
     } else {
         int cursor = std::clamp(event_log_cursor_, 0, static_cast<int>(event_log_entries_.size()) - 1);
-        int scroll = 0;
-        if (cursor >= visible) scroll = cursor - visible + 1;
+        int scroll = cursor;
+        int used_rows = 0;
 
-        for (int i = scroll; i < static_cast<int>(event_log_entries_.size()) && (i - scroll) < visible; ++i) {
+        for (int i = scroll; i < static_cast<int>(event_log_entries_.size()) && used_rows < visible; ++i) {
             const auto& e = event_log_entries_[i];
             bool is_cur = (i == cursor);
             if (is_cur) {
@@ -1623,11 +1694,14 @@ void GraphView::draw_event_log() {
             }
             std::string line = e.text;
             if (e.repeats > 1) line += "  x" + std::to_string(e.repeats);
-            if (static_cast<int>(line.size()) > max_chars)
-                line = line.substr(0, static_cast<size_t>(max_chars - 1)) + "~";
             SDL_Color col = is_cur ? SDL_Color{255, 255, 0, 255} : e.color;
-            draw_text(line.c_str(), vp_x_ + pad, y, col);
-            y += row;
+            auto lines = wrap_line_chars(line, max_chars - 2, 3);
+            if (used_rows + static_cast<int>(lines.size()) > visible) break;
+            for (size_t li = 0; li < lines.size(); ++li) {
+                draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, col);
+                y += row;
+            }
+            used_rows += static_cast<int>(lines.size());
         }
     }
 

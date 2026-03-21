@@ -27,8 +27,11 @@ struct CrackJob {
 
     std::string password;              // filled on Found
     std::string actual_engine;         // "CPU", "GPU", "air" — actual engine launched
+    std::string requested_engine;      // requested engine before fallbacks
     bool force_builtin{false};         // true = this job must run builtin engine (GPU backend failed)
     std::string verify_wordlist_path;  // non-empty = verification run (single-password wordlist)
+    std::string last_reason;           // latest transition/fallback reason
+    std::string last_handshake_id;     // used to detect same/new handshake on same BSSID
     int handshake_count{0};            // how many complete HS captured
     int spin_frame{0};                 // spinner animation (0-3, only when Running)
 
@@ -55,6 +58,11 @@ public:
         bool        found{false};
     };
 
+    struct RuntimeEvent {
+        enum class Level { Info, Warning, Error } level{Level::Info};
+        std::string text;
+    };
+
     struct CrackStatus {
         std::string bssid;
         std::string ssid;
@@ -76,6 +84,9 @@ public:
 
     // Drain newly captured handshakes (for saving to DB). Call periodically.
     std::vector<NewHandshake> drain_new_handshakes();
+
+    // Drain crack/runtime events for GUI toast + event log.
+    std::vector<RuntimeEvent> drain_runtime_events();
 
 
     // For legacy UI (crack indicator top-left)
@@ -109,6 +120,7 @@ private:
     std::unordered_map<std::string, BssidState> states_;
     std::vector<CrackJob> jobs_; // ordered queue; at most one Running at a time
     std::vector<NewHandshake> new_hs_events_; // drain_new_handshakes() returns these
+    std::vector<RuntimeEvent> runtime_events_;
 
     // Find job for bssid, or nullptr
     CrackJob* find_job(const std::string& bssid);
@@ -122,4 +134,5 @@ private:
     static void write_pcap_header(int fd);
     static bool is_crackable(const BssidState& s);
     static std::string safe_name(const std::string& s, size_t max_len = 32);
+    void emit_event(RuntimeEvent::Level level, const std::string& text);
 };

@@ -15,11 +15,9 @@ public:
     void set_renderer(SDL_Renderer* r) { renderer_ = r; }
     void toggle_labels() { labels_full_ = !labels_full_; }
     void toggle_help() { show_help_ = !show_help_; help_scroll_ = 0; }
-    void help_page_next() {
-        int lh = font_ ? TTF_FontHeight(font_) : 14;
-        int visible = (vp_h_ - 16) / (lh + 2);
-        help_scroll_ += std::max(1, visible);
-    }
+    void help_page_next() { help_move(font_ ? std::max(1, (vp_h_ - 16) / (TTF_FontHeight(font_) + 2)) : 1); }
+    void help_move(int delta) { help_scroll_ = std::max(0, help_scroll_ + delta); }
+    bool help_visible() const { return show_help_; }
 
     // AP list overlay
     void toggle_ap_list() { show_ap_list_ = !show_ap_list_; ap_list_cursor_ = 0; show_crack_list_ = false; }
