@@ -1,5 +1,7 @@
 # air-ledger
 
+![air-ledger UI](img/air-ledger.png)
+
 `air-ledger` is an experimental utility for observing a Wi‑Fi environment, building a graph of devices and relationships, capturing WPA handshakes, attempting dictionary-based password recovery, and visually exploring what is happening in the air.
 
 The project was never intended as a "serious industrial product". It was conceived more as:
