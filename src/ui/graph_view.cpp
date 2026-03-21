@@ -1120,9 +1120,10 @@ void GraphView::draw_ap_list(const Graph& graph) {
     };
 
     int cursor = std::clamp(ap_list_cursor_, 0, (int)ids.size() - 1);
+    const char* ap_title = beepy_ui_profile() ? "AP" : "AP LIST";
     std::string ap_hdr = ids.empty()
-        ? "AP LIST 0/0"
-        : std::format("AP LIST {}/{}", cursor + 1, ids.size());
+        ? std::format("{} 0/0", ap_title)
+        : std::format("{} {}/{}", ap_title, cursor + 1, ids.size());
     draw_text(ap_hdr.c_str(), vp_x_ + pad, y, {0, 255, 255, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
@@ -1249,7 +1250,8 @@ void GraphView::draw_crack_list() {
     int crack_cursor = crack_list_entries_.empty()
         ? 0
         : std::clamp(crack_list_cursor_, 0, static_cast<int>(crack_list_entries_.size()) - 1) + 1;
-    std::string crack_hdr = std::format("CRACK QUEUE {}/{}", crack_cursor, crack_list_entries_.size());
+    const char* crack_title = beepy_ui_profile() ? "CRK" : "CRACK QUEUE";
+    std::string crack_hdr = std::format("{} {}/{}", crack_title, crack_cursor, crack_list_entries_.size());
     draw_text(crack_hdr.c_str(), vp_x_ + pad, y, {255, 100, 0, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
@@ -1422,7 +1424,8 @@ void GraphView::draw_hs_list() {
     int hs_cursor = hs_list_entries_.empty()
         ? 0
         : std::clamp(hs_list_cursor_, 0, static_cast<int>(hs_list_entries_.size()) - 1) + 1;
-    std::string hs_hdr = std::format("HANDSHAKES {}/{}", hs_cursor, hs_list_entries_.size());
+    const char* hs_title = beepy_ui_profile() ? "HS" : "HANDSHAKES";
+    std::string hs_hdr = std::format("{} {}/{}", hs_title, hs_cursor, hs_list_entries_.size());
     draw_text(hs_hdr.c_str(), vp_x_ + pad, y, {0, 200, 255, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
@@ -1597,7 +1600,8 @@ void GraphView::draw_anomaly_log() {
     int anomaly_cursor = anomaly_log_.empty()
         ? 0
         : std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1) + 1;
-    std::string hdr = std::format("ANOMALY LOG {}/{}", anomaly_cursor, anomaly_log_.size());
+    const char* anomaly_title = beepy_ui_profile() ? "WARN" : "ANOMALY LOG";
+    std::string hdr = std::format("{} {}/{}", anomaly_title, anomaly_cursor, anomaly_log_.size());
     draw_text(hdr.c_str(), vp_x_ + pad, y, {255, 140, 0, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
@@ -1736,7 +1740,8 @@ void GraphView::draw_event_log() {
     int event_cursor = event_log_entries_.empty()
         ? 0
         : std::clamp(event_log_cursor_, 0, static_cast<int>(event_log_entries_.size()) - 1) + 1;
-    std::string hdr = std::format("EVENT LOG {}/{}", event_cursor, event_log_entries_.size());
+    const char* event_title = beepy_ui_profile() ? "LOG" : "EVENT LOG";
+    std::string hdr = std::format("{} {}/{}", event_title, event_cursor, event_log_entries_.size());
     draw_text(hdr.c_str(), vp_x_ + pad, y, {120, 220, 255, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
