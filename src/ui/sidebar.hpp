@@ -34,6 +34,7 @@ public:
 private:
     SDL_Renderer* renderer_{nullptr};
     TTF_Font* font_{nullptr};
+    int sidebar_x_{0};
     int w_{200};  // current sidebar width, set each render()
     int scroll_px_{0};
     int max_scroll_{0};
@@ -41,7 +42,8 @@ private:
     int step() const { return font_ ? TTF_FontHeight(font_) + 2 : 16; }
 
     void draw_text(const std::string& text, int x, int& y,
-                   SDL_Color color = {220, 220, 220, 255});
+                   SDL_Color color = {220, 220, 220, 255},
+                   int continuation_indent = 2);
     void draw_separator(int x, int y, int w);
 
     void render_client(const Node& n, const Graph& graph, int x, int& y);

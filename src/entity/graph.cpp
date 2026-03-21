@@ -353,6 +353,38 @@ void Graph::mark_active(uint64_t now_us, uint64_t window_us) {
     }
 }
 
+size_t Graph::prune_stale_clients(uint64_t now_us, uint64_t window_us, NodeId preserve_id) {
+    std::unordered_set<NodeId> remove_ids;
+    for (const auto& [id, n] : nodes_) {
+        if (n.type != NodeType::Client) continue;
+        if (id == preserve_id) continue;
+        if (n.has_handshake || n.anomaly_count > 0 || !n.alias.empty()) continue;
+        if (n.last_seen == 0) continue;
+        if (now_us - n.last_seen <= window_us) continue;
+        remove_ids.insert(id);
+    }
+    if (remove_ids.empty()) return 0;
+
+    for (NodeId id : remove_ids) {
+        auto it = nodes_.find(id);
+        if (it != nodes_.end())
+            mac_to_id_.erase(it->second.label);
+        nodes_.erase(id);
+    }
+
+    std::vector<Edge> kept;
+    kept.reserve(edges_.size());
+    edge_index_.clear();
+    for (const auto& e : edges_) {
+        if (remove_ids.count(e.a) || remove_ids.count(e.b)) continue;
+        size_t idx = kept.size();
+        kept.push_back(e);
+        edge_index_[edge_key(e.a, e.b, e.type)] = idx;
+    }
+    edges_.swap(kept);
+    return remove_ids.size();
+}
+
 std::unordered_map<NodeId, uint32_t> Graph::ssid_probe_frequency() const {
     std::unordered_map<NodeId, uint32_t> freq;
     for (auto& [id, n] : nodes_) {

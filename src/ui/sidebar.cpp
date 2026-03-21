@@ -26,45 +26,62 @@ std::string Sidebar::format_age(uint64_t ts_us, uint64_t now_ust) const {
     return std::format("{}d ago", secs / 86400);
 }
 
-void Sidebar::draw_text(const std::string& text, int x, int& y, SDL_Color color) {
+void Sidebar::draw_text(const std::string& text, int x, int& y, SDL_Color color, int continuation_indent) {
     if (!font_) { y += 18; return; }
     if (text.empty()) { y += step(); return; }
-    int max_w = std::max(20, w_ - 14);
+    int right_edge = sidebar_x_ + w_ - 8;
+    int max_w = std::max(20, right_edge - x);
 
-    auto render_line = [&](const std::string& line) {
+    auto render_line = [&](const std::string& line, int line_x) {
         SDL_Surface* surf = TTF_RenderUTF8_Blended(font_, line.c_str(), color);
         if (!surf) { y += step(); return; }
         SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer_, surf);
         int tw = surf->w, th = surf->h;
         SDL_FreeSurface(surf);
         if (!tex) { y += step(); return; }
-        SDL_Rect dst{x, y, tw, th};
+        SDL_Rect dst{line_x, y, tw, th};
         SDL_RenderCopy(renderer_, tex, nullptr, &dst);
         SDL_DestroyTexture(tex);
         y += th + 2;
     };
 
-    std::string current;
-    std::string word;
-    for (size_t i = 0; i <= text.size(); ++i) {
-        char c = (i < text.size()) ? text[i] : ' ';
-        if (c != ' ') {
-            word.push_back(c);
-            continue;
+    auto wrap_to_width = [&](const std::string& src) {
+        std::vector<std::string> lines;
+        std::string current;
+        int line_limit = max_w;
+        auto flush_current = [&]() {
+            if (!current.empty()) {
+                lines.push_back(current);
+                current.clear();
+            }
+            line_limit = std::max(12, max_w - continuation_indent);
+        };
+        for (size_t i = 0; i < src.size(); ++i) {
+            char c = src[i];
+            if (c == '\n') {
+                flush_current();
+                continue;
+            }
+            std::string cand = current;
+            cand.push_back(c);
+            int tw = 0, th = 0;
+            TTF_SizeUTF8(font_, cand.c_str(), &tw, &th);
+            if (tw <= line_limit || current.empty()) {
+                current = std::move(cand);
+                continue;
+            }
+            flush_current();
+            if (c == ' ') continue;
+            current.push_back(c);
         }
-        if (word.empty()) continue;
-        std::string cand = current.empty() ? word : current + " " + word;
-        int tw = 0, th = 0;
-        TTF_SizeUTF8(font_, cand.c_str(), &tw, &th);
-        if (tw <= max_w || current.empty()) {
-            current = cand;
-        } else {
-            render_line(current);
-            current = word;
-        }
-        word.clear();
-    }
-    if (!current.empty()) render_line(current);
+        if (!current.empty()) lines.push_back(current);
+        if (lines.empty()) lines.push_back("");
+        return lines;
+    };
+
+    auto lines = wrap_to_width(text);
+    for (size_t i = 0; i < lines.size(); ++i)
+        render_line(lines[i], x + (i == 0 ? 0 : continuation_indent));
 }
 
 void Sidebar::draw_separator(int x, int y, int w) {
@@ -257,6 +274,7 @@ void Sidebar::render(const Graph& graph, NodeId selected,
                      bool ch_locked, int locked_ch)
 {
     if (!renderer_) return;
+    sidebar_x_ = sidebar_x;
     w_ = w;  // store for sub-render functions
 
     // Clip to sidebar area to prevent text overflow

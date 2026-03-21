@@ -1119,20 +1119,52 @@ void GraphView::draw_ap_list(const Graph& graph) {
         SDL_DestroyTexture(t);
     };
 
-    draw_text("AP LIST", vp_x_ + pad, y, {0, 255, 255, 255});
+    int cursor = std::clamp(ap_list_cursor_, 0, (int)ids.size() - 1);
+    std::string ap_hdr = ids.empty()
+        ? "AP LIST 0/0"
+        : std::format("AP LIST {}/{}", cursor + 1, ids.size());
+    draw_text(ap_hdr.c_str(), vp_x_ + pad, y, {0, 255, 255, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
     SDL_RenderDrawLine(renderer_, vp_x_ + pad, y, vp_x_ + vp_w_ - pad, y);
     y += 4;
 
-    int footer_h = (lh + 2) * 2 + 2; // two hint lines
+    int footer_h = (lh + 2) * 2 + 4; // two hint lines
     int visible = (vp_y_ + vp_h_ - y - footer_h) / row;
     if (visible < 1) visible = 1;
 
-    // Scroll so cursor stays in view
-    int cursor = std::clamp(ap_list_cursor_, 0, (int)ids.size() - 1);
-    int scroll  = 0;
-    if (cursor >= visible) scroll = cursor - visible + 1;
+    auto build_item_lines = [&](const Node& n) {
+        std::string ssid_str;
+        for (auto& e : graph.edges()) {
+            if (e.type != EdgeType::Broadcasts || e.a != n.id) continue;
+            const Node* sn = graph.get_node(e.b);
+            if (sn) { ssid_str = sn->label; break; }
+        }
+        std::string name = !n.alias.empty() ? n.alias : (!ssid_str.empty() ? ssid_str : "<hidden>");
+        std::string sec = n.security.empty() ? "Open" : n.security;
+        std::vector<std::string> out;
+        auto add_lines = [&](const std::string& s, int width) {
+            auto lines = wrap_line_chars(s, width, 2);
+            out.insert(out.end(), lines.begin(), lines.end());
+        };
+        add_lines(n.label, max_chars - 2); // full BSSID
+        add_lines(name, std::max(10, max_chars - 4));
+        std::string extra = "ch:" + (n.channel > 0 ? std::to_string(n.channel) : "?") + "  sec:" + sec;
+        if (!n.password.empty() || !n.passwords.empty()) extra += "  [pw]";
+        add_lines(extra, std::max(10, max_chars - 4));
+        return out;
+    };
+
+    int scroll = cursor;
+    int used_for_window = 0;
+    for (int i = cursor; i >= 0; --i) {
+        const Node* n = graph.get_node(ids[i]);
+        if (!n) continue;
+        int rows = static_cast<int>(build_item_lines(*n).size());
+        if (used_for_window + rows > visible) break;
+        used_for_window += rows;
+        scroll = i;
+    }
 
     int used_rows = 0;
     for (int i = scroll; i < (int)ids.size() && used_rows < visible; ++i) {
@@ -1140,53 +1172,21 @@ void GraphView::draw_ap_list(const Graph& graph) {
         if (!n) continue;
 
         bool is_cur = (i == cursor);
+        auto lines = build_item_lines(*n);
+        if (used_rows + static_cast<int>(lines.size()) > visible) break;
         if (is_cur) {
             SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
             SDL_SetRenderDrawColor(renderer_, 40, 60, 40, 255);
-            SDL_Rect hl{vp_x_, y - 1, vp_w_, lh + 2};
+            SDL_Rect hl{vp_x_, y - 1, vp_w_, static_cast<int>(lines.size()) * row};
             SDL_RenderFillRect(renderer_, &hl);
         }
-
-        // Prefer alias, then SSID (via Broadcasts edge), then last 8 chars of BSSID
-        std::string ssid_str;
-        for (auto& e : graph.edges()) {
-            if (e.type != EdgeType::Broadcasts || e.a != ids[i]) continue;
-            const Node* sn = graph.get_node(e.b);
-            if (sn) { ssid_str = sn->label; break; }
-        }
-        // Short MAC: last 8 chars of BSSID (e.g. "5B:54:E8")
-        std::string mac_short = n->label.size() >= 8
-            ? n->label.substr(n->label.size() - 8) : n->label;
-        std::string name = !n->alias.empty() ? n->alias : ssid_str;
-        // Build password suffix: "[pw1/pw2]" for all distinct cracked passwords
-        std::string pw_suffix;
-        const auto& pws = n->passwords;
-        if (!pws.empty()) {
-            pw_suffix = "[";
-            for (size_t pi = 0; pi < pws.size(); ++pi) {
-                if (pi) pw_suffix += '/';
-                pw_suffix += pws[pi];
-            }
-            pw_suffix += "]";
-        } else if (!n->password.empty()) {
-            pw_suffix = "[" + n->password + "]";
-        }
-
-        // Format: ">XX:XX:XX name ch [pw]"
-        std::string line = (is_cur ? ">" : " ");
-        line += mac_short;
-        if (!name.empty()) line += " " + name;
-        if (n->channel > 0) line += " " + std::to_string(n->channel);
-        if (!pw_suffix.empty()) line += " " + pw_suffix;
-
-        bool has_pw = !pw_suffix.empty();
+        bool has_pw = !n->password.empty() || !n->passwords.empty();
         SDL_Color col = is_cur  ? SDL_Color{255, 255,   0, 255}   // yellow cursor
                       : has_pw  ? SDL_Color{  0, 255,   0, 255}   // green = cracked
                       :           SDL_Color{255, 255, 255, 255};
-        auto lines = wrap_line_chars(line, max_chars - 2, 3);
-        if (used_rows + static_cast<int>(lines.size()) > visible) break;
         for (size_t li = 0; li < lines.size(); ++li) {
-            draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, col);
+            std::string pref = (li == 0) ? (is_cur ? "> " : "  ") : "    ";
+            draw_text((pref + lines[li]).c_str(), vp_x_ + pad, y, col);
             y += row;
         }
         used_rows += static_cast<int>(lines.size());
@@ -1246,7 +1246,11 @@ void GraphView::draw_crack_list() {
         SDL_DestroyTexture(t);
     };
 
-    draw_text("CRACK QUEUE", vp_x_ + pad, y, {255, 100, 0, 255});
+    int crack_cursor = crack_list_entries_.empty()
+        ? 0
+        : std::clamp(crack_list_cursor_, 0, static_cast<int>(crack_list_entries_.size()) - 1) + 1;
+    std::string crack_hdr = std::format("CRACK QUEUE {}/{}", crack_cursor, crack_list_entries_.size());
+    draw_text(crack_hdr.c_str(), vp_x_ + pad, y, {255, 100, 0, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
     SDL_RenderDrawLine(renderer_, vp_x_ + pad, y, vp_x_ + vp_w_ - pad, y);
@@ -1262,9 +1266,9 @@ void GraphView::draw_crack_list() {
     if (crack_list_entries_.empty()) {
         draw_text("(no handshakes captured)", vp_x_ + pad, y, {160, 160, 160, 255});
     } else {
-        int cursor = std::clamp(crack_list_cursor_, 0, (int)crack_list_entries_.size() - 1);
+        int cursor = crack_cursor - 1;
         int scroll = 0;
-        int used_rows = 0;
+        int accum_rows = 0;
         for (int i = 0; i < cursor; ++i) {
             const auto& e = crack_list_entries_[i];
             std::string mac_short = e.bssid.size() >= 8 ? e.bssid.substr(e.bssid.size() - 8) : e.bssid;
@@ -1279,10 +1283,11 @@ void GraphView::draw_crack_list() {
             std::string line = mac_short + " " + e.ssid + " hs:" + std::to_string(e.handshake_count) + " " + status_str;
             if (e.status == S::Found && !e.password.empty()) line += "=" + e.password;
             int row_lines = static_cast<int>(wrap_line_chars(line, max_chars - 2, 3).size());
-            if (used_rows + row_lines >= visible) { scroll = i; used_rows = 0; }
-            else used_rows += row_lines;
+            if (accum_rows + row_lines >= visible) { scroll = i; accum_rows = 0; }
+            else accum_rows += row_lines;
         }
 
+        int used_rows = 0;
         for (int i = scroll; i < (int)crack_list_entries_.size() && used_rows < visible; ++i) {
             const auto& e = crack_list_entries_[i];
             bool is_cur = (i == cursor);
@@ -1335,6 +1340,12 @@ void GraphView::draw_crack_list() {
             SDL_Color row_col = is_cur ? SDL_Color{255, 255, 0, 255} : status_col;
             auto lines = wrap_line_chars(line, max_chars - 2, 3);
             if (used_rows + static_cast<int>(lines.size()) > visible) break;
+            if (is_cur) {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer_, 40, 40, 60, 255);
+                SDL_Rect hl{vp_x_, y - 1, vp_w_, static_cast<int>(lines.size()) * row};
+                SDL_RenderFillRect(renderer_, &hl);
+            }
             for (size_t li = 0; li < lines.size(); ++li) {
                 draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, row_col);
                 y += row;
@@ -1408,7 +1419,11 @@ void GraphView::draw_hs_list() {
         SDL_DestroyTexture(t);
     };
 
-    draw_text("HANDSHAKES", vp_x_ + pad, y, {0, 200, 255, 255});
+    int hs_cursor = hs_list_entries_.empty()
+        ? 0
+        : std::clamp(hs_list_cursor_, 0, static_cast<int>(hs_list_entries_.size()) - 1) + 1;
+    std::string hs_hdr = std::format("HANDSHAKES {}/{}", hs_cursor, hs_list_entries_.size());
+    draw_text(hs_hdr.c_str(), vp_x_ + pad, y, {0, 200, 255, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
     SDL_RenderDrawLine(renderer_, vp_x_ + pad, y, vp_x_ + vp_w_ - pad, y);
@@ -1423,20 +1438,40 @@ void GraphView::draw_hs_list() {
     if (hs_list_entries_.empty()) {
         draw_text("(no handshakes in DB)", vp_x_ + pad, y, {160, 160, 160, 255});
     } else {
-        int cursor = std::clamp(hs_list_cursor_, 0, (int)hs_list_entries_.size() - 1);
-        int scroll = cursor;
+        int cursor = hs_cursor - 1;
+        int scroll = 0;
+        int accum_rows = 0;
+        for (int i = 0; i < cursor; ++i) {
+            const auto& e = hs_list_entries_[i];
+            using S = HandshakeListEntry::Status;
+            std::string status_str;
+            switch (e.status) {
+                case S::Saved:    status_str = "SAVED"; break;
+                case S::Queued:   status_str = "QUEUE"; break;
+                case S::Running:  status_str = "RUN"; break;
+                case S::Found:    status_str = "FOUND"; break;
+                case S::NotFound: status_str = "DONE-"; break;
+            }
+            std::string cli_short = e.client_mac.size() >= 8
+                ? e.client_mac.substr(e.client_mac.size() - 8) : e.client_mac;
+            std::string ap_short = e.ap_bssid.size() >= 8
+                ? e.ap_bssid.substr(e.ap_bssid.size() - 8) : e.ap_bssid;
+            std::string line = cli_short + "<>" + ap_short + "  " + e.ap_ssid + "  " + status_str;
+            if (e.status == S::Found && !e.password.empty())
+                line += "=" + e.password;
+            int rows = static_cast<int>(wrap_line_chars(line, max_chars - 2, 3).size());
+            if (accum_rows + rows >= visible) {
+                scroll = i;
+                accum_rows = 0;
+            } else {
+                accum_rows += rows;
+            }
+        }
         int used_rows = 0;
 
         for (int i = scroll; i < (int)hs_list_entries_.size() && used_rows < visible; ++i) {
             const auto& e = hs_list_entries_[i];
             bool is_cur = (i == cursor);
-
-            if (is_cur) {
-                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-                SDL_SetRenderDrawColor(renderer_, 30, 40, 60, 255);
-                SDL_Rect hl{vp_x_, y - 1, vp_w_, lh + 2};
-                SDL_RenderFillRect(renderer_, &hl);
-            }
 
             using S = HandshakeListEntry::Status;
             std::string status_str;
@@ -1479,6 +1514,12 @@ void GraphView::draw_hs_list() {
             SDL_Color row_col = is_cur ? SDL_Color{255, 255, 0, 255} : status_col;
             auto lines = wrap_line_chars(line, max_chars - 2, 3);
             if (used_rows + static_cast<int>(lines.size()) > visible) break;
+            if (is_cur) {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer_, 30, 40, 60, 255);
+                SDL_Rect hl{vp_x_, y - 1, vp_w_, static_cast<int>(lines.size()) * row};
+                SDL_RenderFillRect(renderer_, &hl);
+            }
             for (size_t li = 0; li < lines.size(); ++li) {
                 draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, row_col);
                 y += row;
@@ -1553,7 +1594,10 @@ void GraphView::draw_anomaly_log() {
     };
 
     // Header
-    std::string hdr = std::format("ANOMALY LOG  ({})", anomaly_log_.size());
+    int anomaly_cursor = anomaly_log_.empty()
+        ? 0
+        : std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1) + 1;
+    std::string hdr = std::format("ANOMALY LOG {}/{}", anomaly_cursor, anomaly_log_.size());
     draw_text(hdr.c_str(), vp_x_ + pad, y, {255, 140, 0, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
@@ -1566,8 +1610,32 @@ void GraphView::draw_anomaly_log() {
         int footer_h = (lh + 2) * 2 + 2;
         int visible  = (vp_y_ + vp_h_ - y - footer_h) / row;
         if (visible < 1) visible = 1;
-        int cursor = std::clamp(anomaly_cursor_, 0, static_cast<int>(anomaly_log_.size()) - 1);
-        int scroll = cursor;
+        int cursor = anomaly_cursor - 1;
+        int scroll = 0;
+        int accum_rows = 0;
+        for (int i = 0; i < cursor; ++i) {
+            const auto& ev = anomaly_log_[i];
+            uint64_t now = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            uint64_t age_s = (now >= ev.ts_us) ? (now - ev.ts_us) / 1'000'000 : 0;
+            std::string age_str = age_s < 60   ? std::format("{}s", age_s)
+                                : age_s < 3600 ? std::format("{}m", age_s / 60)
+                                :                std::format("{}h", age_s / 3600);
+            std::string line = std::format("[{}] {} {}",
+                anomaly_type_name(ev.type),
+                ev.src_mac.size() >= 8 ? ev.src_mac.substr(ev.src_mac.size() - 8) : ev.src_mac,
+                age_str);
+            int need = static_cast<int>(
+                wrap_line_chars(line, max_chars - 2, 2).size()
+                + wrap_line_chars(ev.description, std::max(8, max_chars - 4), 2).size());
+            if (accum_rows + need >= visible) {
+                scroll = i;
+                accum_rows = 0;
+            } else {
+                accum_rows += need;
+            }
+        }
         int used = 0;
         for (int i = scroll; i < (int)anomaly_log_.size() && used < visible; ++i) {
             const auto& ev = anomaly_log_[i];
@@ -1587,12 +1655,6 @@ void GraphView::draw_anomaly_log() {
                                 :                std::format("{}h", age_s / 3600);
 
             bool is_cur = (i == cursor);
-            if (is_cur) {
-                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-                SDL_SetRenderDrawColor(renderer_, 60, 40, 20, 255);
-                SDL_Rect hl{vp_x_, y - 1, vp_w_, lh + 2};
-                SDL_RenderFillRect(renderer_, &hl);
-            }
 
             // "[type] src age"
             std::string line = std::format("[{}] {} {}",
@@ -1603,6 +1665,12 @@ void GraphView::draw_anomaly_log() {
             auto descs = wrap_line_chars(ev.description, std::max(8, max_chars - 4), 2);
             int need = static_cast<int>(lines.size() + descs.size());
             if (used + need > visible) break;
+            if (is_cur) {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer_, 60, 40, 20, 255);
+                SDL_Rect hl{vp_x_, y - 1, vp_w_, need * row};
+                SDL_RenderFillRect(renderer_, &hl);
+            }
             for (size_t li = 0; li < lines.size(); ++li) {
                 draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, col);
                 y += row;
@@ -1665,7 +1733,10 @@ void GraphView::draw_event_log() {
         SDL_DestroyTexture(t);
     };
 
-    std::string hdr = std::format("EVENT LOG  ({})", event_log_entries_.size());
+    int event_cursor = event_log_entries_.empty()
+        ? 0
+        : std::clamp(event_log_cursor_, 0, static_cast<int>(event_log_entries_.size()) - 1) + 1;
+    std::string hdr = std::format("EVENT LOG {}/{}", event_cursor, event_log_entries_.size());
     draw_text(hdr.c_str(), vp_x_ + pad, y, {120, 220, 255, 255});
     y += row;
     SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
@@ -1679,24 +1750,37 @@ void GraphView::draw_event_log() {
     if (event_log_entries_.empty()) {
         draw_text("(no events yet)", vp_x_ + pad, y, {180, 180, 180, 255});
     } else {
-        int cursor = std::clamp(event_log_cursor_, 0, static_cast<int>(event_log_entries_.size()) - 1);
-        int scroll = cursor;
+        int cursor = event_cursor - 1;
+        int scroll = 0;
+        int accum_rows = 0;
+        for (int i = 0; i < cursor; ++i) {
+            std::string line = event_log_entries_[i].text;
+            if (event_log_entries_[i].repeats > 1)
+                line += "  x" + std::to_string(event_log_entries_[i].repeats);
+            int rows = static_cast<int>(wrap_line_chars(line, max_chars - 2, 3).size());
+            if (accum_rows + rows >= visible) {
+                scroll = i;
+                accum_rows = 0;
+            } else {
+                accum_rows += rows;
+            }
+        }
         int used_rows = 0;
 
         for (int i = scroll; i < static_cast<int>(event_log_entries_.size()) && used_rows < visible; ++i) {
             const auto& e = event_log_entries_[i];
             bool is_cur = (i == cursor);
-            if (is_cur) {
-                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
-                SDL_SetRenderDrawColor(renderer_, 40, 60, 40, 255);
-                SDL_Rect hl{vp_x_, y - 1, vp_w_, lh + 2};
-                SDL_RenderFillRect(renderer_, &hl);
-            }
             std::string line = e.text;
             if (e.repeats > 1) line += "  x" + std::to_string(e.repeats);
             SDL_Color col = is_cur ? SDL_Color{255, 255, 0, 255} : e.color;
             auto lines = wrap_line_chars(line, max_chars - 2, 3);
             if (used_rows + static_cast<int>(lines.size()) > visible) break;
+            if (is_cur) {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer_, 40, 60, 40, 255);
+                SDL_Rect hl{vp_x_, y - 1, vp_w_, static_cast<int>(lines.size()) * row};
+                SDL_RenderFillRect(renderer_, &hl);
+            }
             for (size_t li = 0; li < lines.size(); ++li) {
                 draw_text(lines[li].c_str(), vp_x_ + pad + (li == 0 ? 0 : 2), y, col);
                 y += row;

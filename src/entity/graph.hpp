@@ -90,6 +90,8 @@ public:
     // Analytics
     std::vector<std::pair<NodeId, NodeId>> compute_similarities();
     void mark_active(uint64_t now_us, uint64_t window_us = 300'000'000ULL);
+    size_t prune_stale_clients(uint64_t now_us, uint64_t window_us = 300'000'000ULL,
+                               NodeId preserve_id = 0);
 
     // Per-SSID frequency across clients (for Jaccard weighting)
     std::unordered_map<NodeId, uint32_t> ssid_probe_frequency() const;

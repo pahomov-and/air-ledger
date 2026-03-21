@@ -1434,6 +1434,7 @@ void App::run() {
     constexpr uint64_t ANALYTICS_INTERVAL_US = 10'000'000; // 10 sec
     constexpr uint64_t DB_FLUSH_INTERVAL_US  =  5'000'000; //  5 sec
     constexpr uint64_t ACTIVE_MARK_INTERVAL_US = 2'000'000; // 2 sec
+    constexpr uint64_t PRUNE_INTERVAL_US = 30'000'000; // 30 sec
 
     // Run startup diagnostics — checks monitor mode, permissions, capture status
     check_startup();
@@ -1444,6 +1445,7 @@ void App::run() {
     int cur_w = (init_surf && init_surf->w > 1) ? init_surf->w : WIN_W;
     int cur_h = (init_surf && init_surf->h > 1) ? init_surf->h : WIN_H;
     NodeId selected_node = 0;
+    uint64_t last_prune_us = 0;
 
     while (running_.load()) {
         uint64_t frame_start = now_us();
@@ -1783,6 +1785,22 @@ void App::run() {
         if (now - last_active_mark_us_ > ACTIVE_MARK_INTERVAL_US) {
             graph_.mark_active(now);
             last_active_mark_us_ = now;
+        }
+
+        // On weak devices, stale clients quickly dominate both render and layout.
+        // Drop inactive client nodes from the in-memory graph after 5 minutes.
+        if (now - last_prune_us > PRUNE_INTERVAL_US) {
+            bool small_device_mode = is_beepy_profile(ui_profile_) || graph_.nodes().size() > 800;
+            if (small_device_mode) {
+                size_t removed = graph_.prune_stale_clients(now, 300'000'000ULL, selected_node);
+                if (removed > 0) {
+                    std::fprintf(stderr, "[graph] pruned stale clients: %zu\n", removed);
+                    if (last_saved_node_count_ > graph_.nodes().size())
+                        last_saved_node_count_ = graph_.nodes().size();
+                    push_notice("Pruned stale clients: " + std::to_string(removed), 3'000'000ULL);
+                }
+            }
+            last_prune_us = now;
         }
 
         // Layout step — skip every other frame when graph is large (O(n²) repulsion)
