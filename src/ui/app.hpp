@@ -35,6 +35,12 @@ public:
     void init_handshake(const HandshakeConfig& cfg);
     void set_deauth_engine(DeauthEngine e) { deauth_engine_ = e; }
     void set_ui_profile(UiProfile p) { ui_profile_ = p; }
+    // Start channel hopping automatically at init() (instead of waiting for 'h').
+    // dwell_ms <= 0 keeps the default; otherwise clamped to [100, 5000].
+    void set_auto_hop(bool on, int dwell_ms = 0) {
+        auto_hop_ = on;
+        if (dwell_ms > 0) hop_dwell_ms_ = std::max(100, std::min(5000, dwell_ms));
+    }
     void run();
     void stop();
 
@@ -91,6 +97,7 @@ private:
     // Channel hopping
     std::unique_ptr<ChannelHopper> hopper_;
     bool hopping_enabled_{false};
+    bool auto_hop_{false};    // start hopping at init() (set via --hop)
     std::string iface_name_;  // stored for hopper
     int hop_dwell_ms_{500};   // ms per channel, adjustable with +/-
     uint64_t deauth_ch_unlock_us_{0}; // when to restore channel after deauth lock

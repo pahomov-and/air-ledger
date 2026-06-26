@@ -287,6 +287,13 @@ bool App::init(const std::string& iface, const std::string& db_path) {
         // even before hopping is started (e.g. channel-lock on AP selection).
         hopper_ = std::make_unique<ChannelHopper>();
         hopper_->set_iface(iface);
+        // --hop: begin cycling channels immediately instead of waiting for 'h'.
+        if (auto_hop_) {
+            hopper_->start(iface_name_, hop_dwell_ms_);
+            hopping_enabled_ = true;
+            std::fprintf(stderr, "[app] channel hopping auto-started (dwell=%d ms)\n",
+                         hop_dwell_ms_);
+        }
     }
     update_iface_diagnostics();
 

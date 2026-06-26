@@ -56,6 +56,10 @@ static void print_usage(const char* prog) {
         "                           builtin  — pcap_inject(), no external tools\n"
         "                           aireplay — external aireplay-ng subprocess\n"
         "  --ui-profile <p>       UI tuning profile: auto (default), beepy, beepy-window\n"
+        "  --hop                  Start channel hopping automatically at launch\n"
+        "                         (otherwise off until you press 'h'). Live iface only.\n"
+        "  --hop-dwell <ms>       Dwell time per channel, 100-5000 (default 500).\n"
+        "                         Implies --hop.\n"
         "\n"
         "Controls:\n"
         "  Left click             Select node\n"
@@ -94,6 +98,8 @@ int main(int argc, char* argv[]) {
     hs_cfg.auto_crack = true;
     DeauthEngine deauth_engine = DeauthEngine::Builtin;
     UiProfile ui_profile = UiProfile::Auto;
+    bool start_hop = false;
+    int  hop_dwell = 0;   // 0 = use App default
 
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -173,6 +179,16 @@ int main(int argc, char* argv[]) {
                 std::fprintf(stderr, "Unknown deauth engine '%s'. Use: builtin, aireplay\n", eng.c_str());
                 return 1;
             }
+        } else if (arg == "--hop") {
+            start_hop = true;
+        } else if (arg == "--hop-dwell") {
+            if (++i >= argc) { std::fprintf(stderr, "--hop-dwell requires an argument\n"); return 1; }
+            hop_dwell = std::atoi(argv[i]);
+            if (hop_dwell < 100 || hop_dwell > 5000) {
+                std::fprintf(stderr, "--hop-dwell must be 100-5000 ms\n");
+                return 1;
+            }
+            start_hop = true;
         } else if (arg == "--ui-profile") {
             if (++i >= argc) { std::fprintf(stderr, "--ui-profile requires an argument\n"); return 1; }
             std::string p = argv[i];
@@ -201,6 +217,19 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Error: no interface specified.\n\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    // Channel hopping only makes sense on a live interface, not a pcap file.
+    if (start_hop) {
+        auto ends_with = [](const std::string& s, const char* suf) {
+            std::string x(suf);
+            return s.size() >= x.size() && s.compare(s.size() - x.size(), x.size(), x) == 0;
+        };
+        if (ends_with(iface, ".pcap") || ends_with(iface, ".pcapng")) {
+            std::fprintf(stderr,
+                "Warning: --hop ignored for offline pcap input '%s'.\n", iface.c_str());
+            start_hop = false;
+        }
     }
 
     if (ui_profile == UiProfile::Beepy || ui_profile == UiProfile::BeepyWindow) {
@@ -238,6 +267,7 @@ int main(int argc, char* argv[]) {
     App app;
     app.set_deauth_engine(deauth_engine);
     app.set_ui_profile(ui_profile);
+    if (start_hop) app.set_auto_hop(true, hop_dwell);
     if (!app.init(iface, db_path)) {
         std::fprintf(stderr, "[air-ledger] Initialization failed.\n");
         return 1;
